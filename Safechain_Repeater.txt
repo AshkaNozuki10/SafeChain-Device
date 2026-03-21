@@ -1,0 +1,846 @@
+
+==================================================
+FILE: Safechain_Repeater.ino
+==================================================
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Adafruit_NeoPixel.h>
+
+#include "config.h"
+#include "packet.h"
+#include "router.h"
+#include "storage.h"       // <-- FIX: Tells the main file what Storage is
+#include "ble_terminal.h"
+
+// === OBJECTS ===
+RepeaterRouter router;
+Adafruit_NeoPixel strip(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
+Storage storage;
+BLETerminal ble;
+
+// === STATS ===
+unsigned long lastStatsTime = 0;
+const unsigned long STATS_INTERVAL = 60000;  // Every 1 minute
+
+unsigned long lastKeepAlive = 0;
+
+// === BLE NOTIFICATION HELPER ===
+void notifyBLE(String msg) {
+    if (ble.isConnected()) {
+        ble.send(msg);
+    }
+}
+
+// === BLE COMMAND HANDLER ===
+void onBLECommand(String cmd) {
+    cmd.trim(); cmd.toLowerCase();
+    if (cmd == "stats") router.printStats();
+    else if (cmd == "ping") notifyBLE("PONG: Repeater is alive and listening!");
+    else notifyBLE("Commands: stats, ping");
+}
+
+// === HELPERS ===
+void setRGB(int r, int g, int b) {
+    strip.setPixelColor(0, strip.Color(r, g, b));
+    strip.show();
+}
+
+void flashRGB(int r, int g, int b, int times) {
+    for (int i = 0; i < times; i++) {
+        setRGB(r, g, b);
+        delay(100);
+        setRGB(0, 0, 0);
+        delay(100);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    
+    for(int i = 0; i < 50 && !Serial; i++) {
+        delay(100);
+    }
+    
+    Serial.println("\n\n=== SAFECHAIN REPEATER v2.0 ===");
+    Serial.flush();
+    
+    // Init Storage and BLE
+    storage.init();
+    ble.init(storage.getNodeID().c_str());
+    ble.setCommandCallback(onBLECommand);
+
+    // LED Init
+    strip.begin();
+    strip.setBrightness(50);
+    flashRGB(50, 0, 50, 2);  // Purple boot
+    
+    // LoRa Init
+    Serial.println(">>> Init LoRa...");
+    Serial.flush();
+    
+    SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+    LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
+    
+    if (!LoRa.begin(LORA_FREQ)) {
+        Serial.println("❌ LoRa Init Failed!");
+        Serial.flush();
+        while (1) {
+            flashRGB(255, 0, 0, 1);
+            delay(1000);
+        }
+    }
+    
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE);
+    LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD);
+    LoRa.setTxPower(LORA_TXPOWER);
+
+    LoRa.setGain(0);
+    
+    randomSeed(analogRead(0));
+    
+    Serial.println("✅ LoRa Ready (SF12, 14dBm)");
+    Serial.flush();
+    
+    // Router Init
+    router.init();
+    
+    setRGB(0, 0, 0);  // LED off to save power
+    LoRa.receive();  // <--- ADD THIS HERE!
+    
+    Serial.println("\n=================================");
+    Serial.println("   REPEATER ACTIVE");
+    Serial.println("=================================");
+    Serial.flush();
+}
+
+void loop() {
+    // Router update
+    router.update();
+
+    // 👇 ADD THIS ENTIRE KEEP-ALIVE BLOCK
+    if (millis() - lastKeepAlive > 12000) {  // Trigger every 12 seconds
+        lastKeepAlive = millis();
+        
+        // 1. Build a dummy Heartbeat packet
+        SafeChainPacket keepAlivePkt;
+        PacketBuilder::build(keepAlivePkt, storage.getNodeID().c_str(), 
+                             MSG_HEARTBEAT, EM_NONE, 0.0, 0.0, 100);
+        
+        // 2. Blast it at 20dBm to force a 120mA power draw from the battery!
+        LoRa.beginPacket();
+        LoRa.write((uint8_t*)&keepAlivePkt, sizeof(SafeChainPacket));
+        LoRa.endPacket(); // Blocking send
+        
+        // 3. Immediately turn the listening ears back on
+        LoRa.receive(); 
+    }
+    // 👆 END OF KEEP-ALIVE BLOCK
+    
+    // LoRa RX
+    int packetSize = LoRa.parsePacket();
+    if (packetSize == sizeof(SafeChainPacket)) {
+        SafeChainPacket rxPkt;
+        LoRa.readBytes((uint8_t*)&rxPkt, sizeof(SafeChainPacket));
+        
+        if (PacketBuilder::validate(rxPkt)) {
+            rxPkt.rssi = LoRa.packetRssi();
+            
+            Serial.printf("\n[RX] ");
+            PacketBuilder::print(rxPkt);
+            
+            // Purple flash on receive
+            flashRGB(50, 0, 50, 1);
+            
+            // Check if should relay
+            if (router.shouldRelay(rxPkt)) {
+                // Magenta flash for relay queue
+                flashRGB(255, 0, 255, 1);
+                router.queueRelay(rxPkt);
+            }
+        } else {
+            Serial.println(">>> CRC FAIL - Dropped");
+        }
+    }
+    
+    // Periodic stats
+    if (millis() - lastStatsTime > STATS_INTERVAL) {
+        lastStatsTime = millis();
+        router.printStats();
+    }
+    
+    // Serial commands
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        cmd.toLowerCase();
+        
+        if (cmd == "stats") {
+            router.printStats();
+        } else if (cmd == "help") {
+            Serial.println("\n--- COMMANDS ---");
+            Serial.println("stats - Show statistics");
+            Serial.println("help  - This menu");
+        }
+    }
+    
+    delay(10);
+}
+
+
+
+
+==================================================
+FILE: ble_terminal.h
+==================================================
+
+#ifndef BLE_TERMINAL_H
+#define BLE_TERMINAL_H
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+class BLETerminal {
+private:
+    BLEServer *pServer;
+    BLECharacteristic *pTxChar;
+    bool connected;
+    String deviceName;
+    void (*onCommand)(String);
+
+public:
+    BLETerminal();
+    void init(const char* nodeName);
+    bool isConnected() const { return connected; }
+    void send(const String &msg);
+    void setCommandCallback(void (*cb)(String));
+    void handleConnect();
+    void handleDisconnect();
+    void handleData(String data);
+};
+
+static BLETerminal *bleInstance = nullptr;
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        if (bleInstance) bleInstance->handleConnect();
+    }
+    void onDisconnect(BLEServer* pServer) {
+        if (bleInstance) bleInstance->handleDisconnect();
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pChar) {
+        String value = pChar->getValue();
+        if (bleInstance && value.length() > 0) {
+            bleInstance->handleData(value);
+        }
+    }
+};
+
+BLETerminal::BLETerminal() : pServer(nullptr), pTxChar(nullptr), connected(false), onCommand(nullptr) {
+    bleInstance = this;
+}
+
+void BLETerminal::init(const char* nodeName) {
+    deviceName = String("SafeChain_") + nodeName;
+    BLEDevice::init(deviceName.c_str());
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    BLEService *pService = pServer->createService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    
+    BLECharacteristic *pRx = pService->createCharacteristic(
+        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E", BLECharacteristic::PROPERTY_WRITE);
+    pRx->setCallbacks(new MyCallbacks());
+    
+    pTxChar = pService->createCharacteristic(
+        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E", BLECharacteristic::PROPERTY_NOTIFY);
+    pTxChar->addDescriptor(new BLE2902());
+    
+    pService->start();
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    pAdvertising->setScanResponse(true);
+    BLEDevice::startAdvertising();
+    Serial.printf("✅ BLE Active: %s\n", deviceName.c_str());
+}
+
+void BLETerminal::send(const String &msg) {
+   if (connected && pTxChar) {
+        // Add carriage return and newline for terminal formatting
+        String outMsg = msg + "\r\n"; 
+        int len = outMsg.length();
+        int offset = 0;
+
+        // Slice the long string into 20-byte BLE chunks
+        while (offset < len) {
+            int chunkSize = (len - offset > 20) ? 20 : (len - offset);
+            
+            pTxChar->setValue((uint8_t*)outMsg.c_str() + offset, chunkSize);
+            pTxChar->notify();
+            
+            offset += chunkSize;
+            
+            // Critical: Give the ESP32 BLE radio 20ms to push the packet 
+            // before shoving the next chunk into the buffer!
+            delay(20); 
+        }
+    }
+}
+
+void BLETerminal::setCommandCallback(void (*cb)(String)) { onCommand = cb; }
+void BLETerminal::handleConnect() { connected = true; Serial.println("\n>>> BLE: Connected"); }
+void BLETerminal::handleDisconnect() { connected = false; Serial.println("\n>>> BLE: Disconnected"); BLEDevice::startAdvertising(); }
+void BLETerminal::handleData(String data) { if (onCommand) onCommand(data); }
+
+#endif
+
+
+==================================================
+FILE: config.h
+==================================================
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <Arduino.h>
+
+// === HARDWARE PINS ===
+#define PIN_RGB         2
+#define SCK_PIN         4
+#define MISO_PIN        5 //orig 5
+#define MOSI_PIN        6
+#define SS_PIN          7
+#define RST_PIN         8
+#define DIO0_PIN        -1
+
+// === LORA SETTINGS ===
+#define LORA_FREQ       433E6
+#define LORA_SF         11
+#define LORA_BW         125E3
+#define LORA_CR         8
+#define LORA_PREAMBLE   16
+#define LORA_SYNCWORD   0xF3
+#define LORA_TXPOWER    20  // Higher power for repeater
+
+// === PROTOCOL ===
+#define MAX_HOP         10
+#define DUPLICATE_CACHE_SIZE 50  // Larger cache for repeater
+#define RELAY_MIN_DELAY 300
+#define RELAY_MAX_DELAY 1000
+#define DEFAULT_NODE_ID "REP08" // Change to "REP02", "REP03", etc.
+
+// === MESSAGE TYPES ===
+enum MsgType : uint8_t {
+    MSG_EMERGENCY = 0x01A,
+    MSG_HEARTBEAT = 0x02A,
+    MSG_ACK       = 0x0A,
+    MSG_TEST      = 0xFF
+};
+
+// <-- FIX: Added missing EmergencyType enum
+enum EmergencyType : uint8_t {
+    EM_NONE  = 0x00,
+    EM_FIRE  = 0x01,
+    EM_FLOOD = 0x02,
+    EM_CRIME = 0x03,
+    EM_SAFE  = 0x04,
+    EM_TEST  = 0xFF
+};
+
+#endif
+
+
+==================================================
+FILE: led_manager.h
+==================================================
+
+#ifndef LED_MANAGER_H
+#define LED_MANAGER_H
+
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+#include "config.h"
+
+class LEDManager {
+private:
+    Adafruit_NeoPixel strip;
+    
+public:
+    LEDManager();
+    
+    void init();
+    void setColor(int r, int g, int b);
+    void flash(int r, int g, int b, int times);
+    void updateStatus(bool bleConn, bool gpsValid);
+    void off();
+};
+
+#endif
+
+
+==================================================
+FILE: packet.h
+==================================================
+
+#ifndef PACKET_H
+#define PACKET_H
+
+#include <Arduino.h>
+#include "config.h"
+
+struct __attribute__((packed)) SafeChainPacket {
+    char     srcID[6];      // "FOB01" + null terminator
+    uint8_t  msgType;       // MsgType enum
+    uint16_t seqNum;        // Sequence counter
+    float    latitude;      // Raw float (4 bytes)
+    float    longitude;     // Raw float (4 bytes)
+    uint8_t  hopCount;      // Current hop
+    uint8_t  maxHop;        // Limit (always 3)
+    uint8_t  battery;       // 0-100%
+    int16_t  rssi;  
+    uint16_t crc;           // CRC-16-CCITT
+};
+
+class PacketBuilder {
+public:
+    static uint16_t seqCounter;
+
+
+    // Build new packet
+    static void build(SafeChainPacket &pkt, 
+                      const char* srcID,
+                      MsgType type,
+                      EmergencyType emType,
+                      float lat, float lon,
+                      uint8_t batt);
+    
+    // Build ACK response
+    static void buildACK(SafeChainPacket &pkt,
+                         const char* srcID,
+                         uint16_t ackSeqNum);
+    
+    // CRC calculation
+    static uint16_t calcCRC16(const uint8_t *data, uint16_t length);
+    
+    // Validation
+    static bool validate(const SafeChainPacket &pkt);
+    
+    // Relay preparation
+    static bool prepareRelay(SafeChainPacket &pkt);
+    
+    // Debug print
+    static void print(const SafeChainPacket &pkt);
+};
+
+#endif
+
+
+==================================================
+FILE: router.h
+==================================================
+
+#ifndef ROUTER_H
+#define ROUTER_H
+
+#include <Arduino.h>
+#include "config.h"
+#include "packet.h"
+
+class RepeaterRouter {
+private:
+    struct CacheEntry {
+        char srcID[6];
+        uint16_t seqNum;
+        uint8_t msgType;  // 👇 FIX: Added msgType to the memory!
+    };
+    CacheEntry seenCache[DUPLICATE_CACHE_SIZE];
+    uint8_t cacheIndex;
+    
+    // --- NEW: Time-Based Deduplication (Spam Protection) ---
+    struct EmergencyDedup {
+        char srcID[6];
+        uint8_t msgType;
+        unsigned long timestamp;
+    };
+    EmergencyDedup recentEmergencies[10];
+    uint8_t dedupIndex;
+    // -------------------------------------------------------
+    
+    // Pending relay state
+    SafeChainPacket pendingPacket;
+    bool isPending;
+    unsigned long relayTriggerTime;
+    
+    // Statistics
+    uint32_t packetsReceived;
+    uint32_t packetsRelayed;
+    uint32_t packetsDropped;
+
+    // 👇 FIX: Update these two lines to include uint8_t msgType
+    bool isDuplicate(const char* srcID, uint16_t seqNum, uint8_t msgType);
+    void markSeen(const char* srcID, uint16_t seqNum, uint8_t msgType);
+    
+public:
+    RepeaterRouter();
+    
+    void init();
+    bool shouldRelay(const SafeChainPacket &pkt);
+    void queueRelay(const SafeChainPacket &pkt);
+    void update();
+    void printStats();
+    
+private:
+    bool isDuplicate(const char* srcID, uint16_t seqNum);
+    void markSeen(const char* srcID, uint16_t seqNum);
+    
+    // --- NEW: Time-Based Methods ---
+    bool isRecentEmergency(const SafeChainPacket &pkt);
+    void markRecentEmergency(const SafeChainPacket &pkt);
+};
+
+#endif
+
+
+==================================================
+FILE: storage.h
+==================================================
+
+#ifndef STORAGE_H
+#define STORAGE_H
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include "config.h"
+
+class Storage {
+private:
+    Preferences prefs;
+    
+public:
+    Storage();
+    
+    void init();
+    
+    // Node ID
+    String getNodeID();
+    void setNodeID(const String &id);
+    
+    // Relay mode
+    bool getRelayEnabled();
+    void setRelayEnabled(bool enabled);
+    
+    // Spreading Factor
+    uint8_t getSpreadingFactor();
+    void setSpreadingFactor(uint8_t sf);
+};
+
+#endif
+
+
+==================================================
+FILE: led_manager.cpp
+==================================================
+
+#include "led_manager.h"
+
+LEDManager::LEDManager() : strip(1, PIN_RGB, NEO_GRB + NEO_KHZ800) {}
+
+void LEDManager::init() {
+    strip.begin();
+    strip.setBrightness(50);
+    off();
+}
+
+void LEDManager::setColor(int r, int g, int b) {
+    strip.setPixelColor(0, strip.Color(r, g, b));
+    strip.show();
+}
+
+void LEDManager::flash(int r, int g, int b, int times) {
+    for (int i = 0; i < times; i++) {
+        setColor(r, g, b);
+        delay(100);
+        off();
+        delay(100);
+    }
+}
+
+void LEDManager::updateStatus(bool bleConn, bool gpsValid) {
+    if (bleConn) setColor(0, 0, 50);        // Dim Blue
+    else if (gpsValid) setColor(0, 50, 0);  // Dim Green
+    else off();
+}
+
+void LEDManager::off() {
+    setColor(0, 0, 0);
+}
+
+
+==================================================
+FILE: packet.cpp
+==================================================
+
+#include "packet.h"
+
+// 👇 ADD THIS COUNTER
+uint16_t PacketBuilder::seqCounter = 0;
+
+// 👇 ADD THIS ENTIRE BUILD FUNCTION
+void PacketBuilder::build(SafeChainPacket &pkt, 
+                          const char* srcID,
+                          MsgType type,
+                          EmergencyType emType,
+                          float lat, float lon,
+                          uint8_t batt) {
+    memset(&pkt, 0, sizeof(SafeChainPacket));
+    strncpy(pkt.srcID, srcID, 5);
+    pkt.srcID[5] = '\0';
+    
+    pkt.msgType = (type == MSG_EMERGENCY) ? emType : type;
+    pkt.seqNum = seqCounter++;
+    pkt.latitude = lat;
+    pkt.longitude = lon;
+    pkt.hopCount = 0;
+    pkt.maxHop = MAX_HOP;
+    pkt.battery = batt;
+    pkt.rssi = 0; 
+    
+    // Calculate CRC (exclude CRC field itself)
+    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+}
+
+uint16_t PacketBuilder::calcCRC16(const uint8_t *data, uint16_t length) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+bool PacketBuilder::validate(const SafeChainPacket &pkt) {
+    uint16_t expected = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+    return (pkt.crc == expected);
+}
+
+bool PacketBuilder::prepareRelay(SafeChainPacket &pkt) {
+    if (pkt.hopCount >= pkt.maxHop) return false;
+    
+    pkt.hopCount++;
+    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+    return true;
+}
+
+void PacketBuilder::print(const SafeChainPacket &pkt) {
+    Serial.printf("[PKT] ID:%s Type:%02X Seq:%u Hop:%u/%u Lat:%.6f Lon:%.6f Batt:%u%% RSSI:%d\n",
+        pkt.srcID, pkt.msgType, pkt.seqNum, pkt.hopCount, pkt.maxHop,
+        pkt.latitude, pkt.longitude, pkt.battery, pkt.rssi);
+}
+
+
+==================================================
+FILE: router.cpp
+==================================================
+
+#include "router.h"
+#include <LoRa.h>
+
+RepeaterRouter::RepeaterRouter() 
+    : cacheIndex(0), isPending(false), 
+      packetsReceived(0), packetsRelayed(0), packetsDropped(0) {
+    memset(seenCache, 0, sizeof(seenCache));
+     memset(recentEmergencies, 0, sizeof(recentEmergencies)); // <-- ADD THIS
+}
+
+void RepeaterRouter::init() {
+    Serial.println("✅ Repeater Router Ready");
+}
+
+extern void notifyBLE(String msg);
+
+bool RepeaterRouter::shouldRelay(const SafeChainPacket &pkt) {
+    packetsReceived++;
+    
+    // 👇 FIX: Now we check ID, Sequence, AND the Message Type!
+    if (isDuplicate(pkt.srcID, pkt.seqNum, pkt.msgType)) {
+        Serial.println(">>> Duplicate detected");
+        if (isPending && pendingPacket.seqNum == pkt.seqNum) {
+            Serial.println(">>> SMART CANCEL: Overheard another repeater.");
+            notifyBLE("🛑 CANCELLED: Overheard Repeater relaying Seq " + String(pkt.seqNum));
+            isPending = false; 
+        }
+        packetsDropped++;
+        return false;
+    }
+    
+    // 2. Handle ACKs (CRITICAL: Do NOT return false here!)
+    if (pkt.msgType == MSG_ACK) {
+        Serial.println(">>> Overheard ACK flowing to Node");
+        notifyBLE("✅ HEARD ACK: Gateway confirmed Seq " + String(pkt.seqNum));
+        
+        if (isPending && pendingPacket.seqNum == pkt.seqNum) {
+            Serial.println(">>> SMART CANCEL: Gateway already ACKed this!");
+            notifyBLE("🛑 CANCELLED: Gateway already ACKed Seq " + String(pkt.seqNum));
+            isPending = false; 
+        }
+        // Notice we do NOT return false here. The Repeater MUST relay the ACK!
+    }
+    
+    // 3. Check hop limit
+    if (pkt.hopCount >= pkt.maxHop) {
+        Serial.println(">>> Max hop reached");
+        packetsDropped++;
+        return false;
+    }
+    
+    return true;
+}
+
+bool RepeaterRouter::isRecentEmergency(const SafeChainPacket &pkt) {
+    // Only apply to emergencies
+    if (pkt.msgType < EM_FIRE || pkt.msgType > EM_CRIME) {
+        return false;
+    }
+    
+    for (int i = 0; i < 10; i++) {
+        if (strcmp(recentEmergencies[i].srcID, pkt.srcID) == 0 &&
+            recentEmergencies[i].msgType == pkt.msgType &&
+            (millis() - recentEmergencies[i].timestamp) < 30000) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RepeaterRouter::markRecentEmergency(const SafeChainPacket &pkt) {
+    // Only mark emergencies
+    if (pkt.msgType >= EM_FIRE && pkt.msgType <= EM_CRIME) {
+        strncpy(recentEmergencies[dedupIndex].srcID, pkt.srcID, 5);
+        recentEmergencies[dedupIndex].srcID[5] = '\0'; // Ensure null termination
+        recentEmergencies[dedupIndex].msgType = pkt.msgType;
+        recentEmergencies[dedupIndex].timestamp = millis();
+        dedupIndex = (dedupIndex + 1) % 10;
+    }
+}
+
+void RepeaterRouter::queueRelay(const SafeChainPacket &pkt) {
+    memcpy(&pendingPacket, &pkt, sizeof(SafeChainPacket));
+    
+    if (!PacketBuilder::prepareRelay(pendingPacket)) {
+        packetsDropped++;
+        return;
+    }
+    
+    markSeen(pkt.srcID, pkt.seqNum, pkt.msgType);
+    relayTriggerTime = millis() + random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
+    isPending = true;
+    
+    // Send to BLE
+    String msg = "⏳ QUEUED: Node " + String(pkt.srcID) + " Seq " + String(pkt.seqNum) + " (Wait " + String(relayTriggerTime - millis()) + "ms)";
+    Serial.println(msg);
+    notifyBLE(msg);
+}
+
+void RepeaterRouter::update() {
+    if (!isPending) return;
+    if (millis() < relayTriggerTime) return;
+    
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
+    LoRa.endPacket(); // Blocking send
+    LoRa.receive();   // Turn ears back on
+    
+    isPending = false;
+    packetsRelayed++;
+    
+    // Send to BLE
+    String msg = "📡 RELAYED: Seq " + String(pendingPacket.seqNum) + " (Hop " + String(pendingPacket.hopCount) + ")";
+    Serial.println(msg);
+    notifyBLE(msg);
+}
+
+void RepeaterRouter::printStats() {
+    String stats = "\n=== REPEATER STATS ===\n";
+    stats += "Received: " + String(packetsReceived) + "\n";
+    stats += "Relayed:  " + String(packetsRelayed) + "\n";
+    stats += "Dropped:  " + String(packetsDropped) + "\n";
+    
+    if (packetsReceived > 0) {
+        float relayRate = (float)packetsRelayed / packetsReceived * 100.0;
+        stats += "Relay Rate: " + String(relayRate, 1) + "%\n";
+    }
+    
+    Serial.println(stats);
+    notifyBLE(stats);
+}
+
+bool RepeaterRouter::isDuplicate(const char* srcID, uint16_t seqNum, uint8_t msgType) {
+    for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
+        if (seenCache[i].seqNum == seqNum && 
+            seenCache[i].msgType == msgType &&
+            strcmp(seenCache[i].srcID, srcID) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RepeaterRouter::markSeen(const char* srcID, uint16_t seqNum, uint8_t msgType) {
+    strncpy(seenCache[cacheIndex].srcID, srcID, 5);
+    seenCache[cacheIndex].seqNum = seqNum;
+    // 👇 FIX: Save the msgType
+    seenCache[cacheIndex].msgType = msgType;
+    cacheIndex = (cacheIndex + 1) % DUPLICATE_CACHE_SIZE;
+}
+
+
+==================================================
+FILE: storage.cpp
+==================================================
+
+#include "storage.h"
+
+Storage::Storage() {}
+
+void Storage::init() {
+    prefs.begin("safechain", false);
+}
+
+String Storage::getNodeID() {
+    return prefs.getString("uid", DEFAULT_NODE_ID);
+}
+
+void Storage::setNodeID(const String &id) {
+    prefs.putString("uid", id.c_str());
+}
+
+bool Storage::getRelayEnabled() {
+    return prefs.getBool("relay", false);
+}
+
+void Storage::setRelayEnabled(bool enabled) {
+    prefs.putBool("relay", enabled);
+}
+
+uint8_t Storage::getSpreadingFactor() {
+    return prefs.getUChar("sf", LORA_SF);
+}
+
+void Storage::setSpreadingFactor(uint8_t sf) {
+    prefs.putUChar("sf", sf);
+}
+

@@ -1,0 +1,1869 @@
+
+==================================================
+FILE: Safechain_Node.ino
+==================================================
+
+//node code
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <OneButton.h>
+#include <driver/rtc_io.h> // 👇 ADD THIS LINE
+
+#include "config.h"
+#include "packet.h"
+#include "router.h"
+#include "emergency.h"
+#include "ble_terminal.h"
+#include "gps_manager.h"
+#include "led_manager.h"
+#include "storage.h"
+
+// === GLOBAL OBJECTS ===
+Storage storage;
+Router router;
+EmergencyManager emergency;
+BLETerminal ble;
+GPSManager gpsManager;
+LEDManager led;
+
+// Buttons
+OneButton btnFlood(PIN_BTN_FLOOD, true);
+OneButton btnFire(PIN_BTN_FIRE, true);
+OneButton btnCrime(PIN_BTN_CRIME, true);
+
+// State
+String nodeID;
+bool autoMode = false;
+unsigned long lastAutoTime = 0;
+unsigned long lastLedUpdate = 0;
+unsigned long lastBleUpdate = 0;
+
+unsigned long lastBatteryWarnTime = 0;
+const unsigned long BATTERY_WARN_INTERVAL = 10000; // 10 seconds
+
+// 👇 ADD THESE TWO LINES RIGHT HERE!
+bool needsGPSRefine = false;
+EmergencyType activeEmergency = EM_NONE;
+
+// --- POWER MANAGEMENT ---
+unsigned long lastActivityTime = 0;
+const unsigned long SLEEP_TIMEOUT = 180000; // 3 Minutes (180,000 ms)
+RTC_DATA_ATTR int bootCount = 0; // Remembers how many times it woke up from sleep
+
+// === FORWARD DECLARATIONS ===
+void handleCommand(String cmd);
+void sendTestPacket();
+void triggerFlood();
+void triggerFire();
+void triggerCrime();
+void triggerSafe();
+void onGPSInject(float lat, float lon);
+void onBLECommand(String cmd);
+void flashRGB(int r, int g, int b, int times);
+uint8_t getBatteryLevel();
+
+// === SETUP ===
+void setup() {
+     Serial.begin(115200);
+    
+    // Wait for Serial Monitor to connect (ESP32-C3 USB CDC fix)
+    delay(2000);  // ← ADD THIS
+    while (!Serial && millis() < 5000) {
+        delay(10);  // Wait up to 5 seconds for Serial Monitor
+    }
+    
+    Serial.println("\n\n=== SAFECHAIN LITE v2.0 ===");
+    
+    // Storage
+    storage.init();
+    nodeID = storage.getNodeID();
+    Serial.printf(">>> Node ID: %s\n", nodeID.c_str());
+    
+    // Buzzer
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
+    
+    // LED
+    led.init();
+    led.flash(50, 50, 50, 1);
+    
+   // === Buttons ===
+    
+    // 1. Increase Debounce Time to 80ms to forgive jittery/bouncing metal contacts
+    btnFlood.setDebounceMs(80);
+    btnFire.setDebounceMs(80);
+    btnCrime.setDebounceMs(80);
+
+    // 2. Set the Hold duration to 1.5 seconds (1500ms) for better emergency UX
+    btnFlood.setPressMs(1200);
+    btnFire.setPressMs(1200);
+    btnCrime.setPressMs(1200);
+
+    // 3. Attach LONG PRESS to trigger the actual emergencies
+    btnFlood.attachLongPressStart(triggerFlood);
+    btnFire.attachLongPressStart(triggerFire);
+    btnCrime.attachLongPressStart(triggerCrime);
+    
+    // 4. Attach DOUBLE CLICK to the new "Safe" function
+    btnFlood.attachDoubleClick(triggerSafe);
+    btnFire.attachDoubleClick(triggerSafe);
+    btnCrime.attachDoubleClick(triggerSafe);
+    
+    // GPS
+    gpsManager.init();
+    
+    // BLE
+    ble.init(nodeID.c_str());
+    ble.setGPSInjectCallback(onGPSInject);
+    ble.setCommandCallback(onBLECommand);
+    
+    // Router
+    router.init(nodeID.c_str(), storage.getRelayEnabled());
+    
+    // Emergency
+    emergency.init(nodeID.c_str());
+    
+    // LoRa
+    SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+    LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
+    
+    if (!LoRa.begin(LORA_FREQ)) {
+        Serial.println("❌ LoRa Init Failed!");
+        led.setColor(255, 0, 0);
+        while(1);
+    }
+    
+    LoRa.setSpreadingFactor(storage.getSpreadingFactor());
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE);
+    LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD);
+    LoRa.setTxPower(LORA_TXPOWER);
+    
+    randomSeed(analogRead(0));
+    LoRa.sleep();
+
+    // To this:
+    LoRa.receive();
+ 
+    
+    
+    // === DEEP SLEEP WAKE-UP HANDLER ===
+    // 1. Ask the ESP32 why it just booted up
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    
+    // 👇 FIX: Check for EXT1 wakeup
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+        Serial.println("\n⚠️ WOKE UP FROM DEEP SLEEP VIA BUTTON!");
+        
+        // 👇 FIX: Ask the EXT1 controller exactly WHICH pin triggered the wake-up
+        uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+
+        // 4. Instantly trigger the correct emergency!
+        if (wakeup_pin_mask & (1ULL << PIN_BTN_FLOOD)) {
+            Serial.println(">>> WAKEUP REASON: FLOOD BUTTON");
+            triggerFlood();
+            
+        } else if (wakeup_pin_mask & (1ULL << PIN_BTN_FIRE)) {
+            Serial.println(">>> WAKEUP REASON: FIRE BUTTON");
+            triggerFire();
+            
+        } else if (wakeup_pin_mask & (1ULL << PIN_BTN_CRIME)) {
+            Serial.println(">>> WAKEUP REASON: CRIME BUTTON");
+            triggerCrime();
+        }
+        
+    } else {
+        // Normal power-on or manual reset button
+        Serial.println("\n>>> Normal Boot / Power On");
+    }
+
+    Serial.println("✅ LoRa Ready (SF12 + CRC + SYNC)");
+    Serial.println("\n--- Ready for Commands ---");
+    printMenu();
+}
+
+// === MAIN LOOP ===
+void loop() {
+    // Button ticks
+    btnFlood.tick();
+    btnFire.tick();
+    btnCrime.tick();
+    
+    // GPS update
+    gpsManager.update();
+    
+    // BLE update
+    ble.update();
+    
+    // Emergency state machine
+    emergency.update();
+    
+    // Router relay processing
+    router.update();
+    
+    // LoRa RX
+    int packetSize = LoRa.parsePacket();
+    if (packetSize == sizeof(SafeChainPacket)) {
+        SafeChainPacket rxPkt;
+        LoRa.readBytes((uint8_t*)&rxPkt, sizeof(SafeChainPacket));
+        
+        if (PacketBuilder::validate(rxPkt)) {
+            rxPkt.rssi = LoRa.packetRssi();  // Store RSSI
+            
+            Serial.printf("\n[LORA RX] ");
+            PacketBuilder::print(rxPkt);
+            Serial.printf("RSSI: %d dBm\n", rxPkt.rssi);
+            
+            led.flash(0, 255, 255, 2);  // Cyan
+            
+            // Handle ACK
+            if (rxPkt.msgType == MSG_ACK) {
+                emergency.handleACK(rxPkt);
+            }
+            
+            // Queue relay if applicable
+            if (router.shouldRelay(rxPkt)) {
+                led.flash(255, 0, 255, 1);  // Magenta
+                router.queueRelay(rxPkt);
+            }
+        } else {
+            Serial.println(">>> CRC FAIL - Dropped");
+        }
+    }
+    
+    // LED status update
+    if (millis() - lastLedUpdate > LED_UPDATE_INTERVAL) {
+        lastLedUpdate = millis();
+        led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
+    }
+
+    // 👇 ADD THIS ENTIRE BLOCK: Low Battery Warning
+    if (millis() - lastBatteryWarnTime > BATTERY_WARN_INTERVAL) {
+        lastBatteryWarnTime = millis();
+        
+        // Check if the battery is 15% or lower
+        if (getBatteryLevel() <= 15) {
+            Serial.println("⚠️ WARNING: Low Battery!");
+            
+            // Flash Red twice quickly to grab the user's attention
+            led.flash(255, 0, 0, 2); 
+            
+            // Restore the normal Bluetooth/GPS dim color after flashing
+            led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
+        }
+    }
+    
+    // BLE periodic update
+    if (ble.isConnected() && millis() - lastBleUpdate > BLE_UPDATE_INTERVAL) {
+        lastBleUpdate = millis();
+        float lat, lon;
+        gpsManager.determineLocation(lat, lon, false);
+        String update = String(lat, 6) + "," + String(lon, 6);
+        ble.send(update);
+    }
+    
+    // Auto mode
+    if (autoMode && millis() - lastAutoTime > AUTO_MODE_INTERVAL) {
+        lastAutoTime = millis();
+        Serial.println("\n[AUTO] Triggering test...");
+        sendTestPacket();
+    }
+    
+    // Serial commands
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        handleCommand(cmd);
+    }
+    
+    delay(10);
+
+    // === DEEP SLEEP CHECK ===
+    // If no emergencies are active, check if it's time to sleep
+    if (emergency.getState() == EM_STATE_IDLE) {
+        
+        // Reset the timer if a button is being pressed or BLE is actively receiving data
+        if (btnFlood.isLongPressed() || btnFire.isLongPressed() || btnCrime.isLongPressed()) {
+            lastActivityTime = millis();
+        }
+
+        // If 3 minutes have passed with no activity...
+        if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
+            Serial.println("\n💤 Activity timeout reached. Entering Deep Sleep...");
+            ble.send("💤 Node entering Deep Sleep to save battery.");
+            delay(500); // Give BLE time to send the message
+
+            // Turn off LED and LoRa module
+            led.off();
+            LoRa.sleep();
+
+            // 👇 THE S3 FIX: Tell the RTC processor to hold the pull-ups ON during sleep!
+            rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_FLOOD);
+            rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_FIRE);
+            rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_CRIME);
+
+            // Disable pull-downs just to be absolutely safe
+            rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_FLOOD);
+            rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_FIRE);
+            rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_CRIME);
+
+            // Configure the Buttons to wake up the ESP32 (Active LOW)
+            // Note: Use esp_sleep_enable_ext1_wakeup for S3, or esp_deep_sleep_enable_gpio_wakeup for C3.
+            // Using a bitmask to listen to all 3 buttons simultaneously
+            // 👇 FIX: Use the EXT1 controller for multiple pins
+            uint64_t wakeMask = (1ULL << PIN_BTN_FLOOD) | (1ULL << PIN_BTN_FIRE) | (1ULL << PIN_BTN_CRIME);
+            esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_LOW);
+
+            // GO TO SLEEP
+            esp_deep_sleep_start();
+        }
+    } else {
+        // If an emergency is active, constantly reset the sleep timer!
+        lastActivityTime = millis();
+    }
+}
+
+// === HELPERS ===
+void flashRGB(int r, int g, int b, int times) {
+    led.flash(r, g, b, times);
+    led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
+}
+
+uint8_t getBatteryLevel() {
+   // 👇 NEW: Take 10 rapid samples and average them to eliminate ADC noise!
+    uint32_t totalMilliVolts = 0;
+    for (int i = 0; i < 10; i++) {
+        totalMilliVolts += analogReadMilliVolts(PIN_BATTERY);
+        delay(2); 
+    }
+    float pinMilliVolts = totalMilliVolts / 10.0;
+
+    // Convert to Volts
+    float pinVoltage = pinMilliVolts / 1000.0;
+    
+    // Multiply by 2 because our resistors cut the battery voltage in half
+    float batteryVoltage = pinVoltage * 2.0;
+    
+    // Debug print so you can verify the reading in your Serial Monitor
+    Serial.printf(">>> Battery Read: %.2fV\n", batteryVoltage);
+
+    // Hard limits for a 3.7V LiPo
+    if (batteryVoltage >= 4.20) return 100;
+    if (batteryVoltage <= 3.20) return 0;
+    
+    // Accurate LiPo Discharge Curve Mapping
+    float percentage;
+    if (batteryVoltage >= 3.80) {
+        // Top 50% of the battery is between 3.80V and 4.20V
+        percentage = 50.0 + ((batteryVoltage - 3.80) / (4.20 - 3.80)) * 50.0;
+    } else {
+        // Bottom 50% drops extremely fast between 3.20V and 3.80V
+        percentage = ((batteryVoltage - 3.20) / (3.80 - 3.20)) * 50.0;
+    }
+    
+    return (uint8_t)percentage;
+}
+
+void sendTestPacket() {
+    float lat, lon;
+    gpsManager.determineLocation(lat, lon, true);
+    
+    SafeChainPacket pkt;
+    PacketBuilder::build(pkt, nodeID.c_str(), MSG_TEST, 
+                         EM_NONE, lat, lon, getBatteryLevel());
+                         
+    router.cancelRelay();  // Priority override
+    
+    // 👇 Update Terminal and BLE
+    Serial.println(">>> SENDING TEST...");
+    ble.send("📡 SENDING TEST PING...");
+    
+    flashRGB(255, 255, 255, 2);
+    tone(PIN_BUZZER, 3000, 100); // Quick chirp
+    
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&pkt, sizeof(SafeChainPacket));
+    LoRa.endPacket(); 
+    
+    LoRa.receive();
+    
+    // 👇 Update Terminal and BLE
+    Serial.println(">>> SENT!");
+    ble.send("✅ TEST PACKET AIRBORNE!");
+}
+
+//
+
+// void triggerFlood() {
+//     Serial.println("\n🚨 FLOOD DETECTED!");
+//     ble.send("🚨 FLOOD");
+//     led.flash(0, 0, 255, 2);
+    
+//     // Quick, single sonar ping
+//     tone(PIN_BUZZER, 2000, 400); 
+//     delay(400);
+
+//     float lat, lon;
+//     gpsManager.determineLocation(lat, lon, true);
+//     emergency.trigger(EM_FLOOD, lat, lon, getBatteryLevel());
+// }
+
+// void triggerFire() {
+//     Serial.println("\n🚨 FIRE DETECTED!");
+//     ble.send("🚨 FIRE");
+//     led.flash(255, 50, 0, 2);
+    
+//     // Just ONE cycle of the European Hi-Lo pattern
+//     tone(PIN_BUZZER, 1000, 300); delay(300); 
+//     tone(PIN_BUZZER, 2500, 300); delay(300); 
+
+//     float lat, lon;
+//     gpsManager.determineLocation(lat, lon, true);
+//     emergency.trigger(EM_FIRE, lat, lon, getBatteryLevel());
+// }
+
+// void triggerCrime() {
+//     Serial.println("\n🚨 CRIME DETECTED!");
+//     ble.send("🚨 CRIME");
+//     led.flash(255, 0, 0, 2);
+    
+//     // One quick, aggressive sweep (Police Yelp)
+//     for(int f=1000; f<=3500; f+=200) { 
+//         tone(PIN_BUZZER, f, 20);
+//         delay(20); 
+//     }
+
+//     float lat, lon;
+//     gpsManager.determineLocation(lat, lon, true);
+//     emergency.trigger(EM_CRIME, lat, lon, getBatteryLevel());
+// }
+
+// Button Sirens code
+
+void triggerFlood() {
+    Serial.println("\n🚨 FLOOD DETECTED!");
+    ble.send("🚨 FLOOD");
+    led.flash(0, 0, 255, 2);
+
+    // Siren: Slow "Sonar" Ping (High Pitch)
+    for(int i=0; i<3; i++) { 
+      tone(PIN_BUZZER, 2000, 300); 
+      delay(600); 
+    }
+
+    float lat, lon;
+    gpsManager.determineLocation(lat, lon, true);
+    emergency.trigger(EM_FLOOD, lat, lon, getBatteryLevel());
+}
+
+void triggerFire() {
+    Serial.println("\n🚨 FIRE DETECTED!");
+    ble.send("🚨 FIRE");
+    led.flash(255, 50, 0, 2);
+
+    // Siren: Fast European Hi-Lo pattern
+    for(int i=0; i<4; i++) { 
+      tone(PIN_BUZZER, 1000, 300); delay(300); 
+      tone(PIN_BUZZER, 2500, 300); delay(300); 
+    }
+
+    float lat, lon;
+    gpsManager.determineLocation(lat, lon, true);
+    emergency.trigger(EM_FIRE, lat, lon, getBatteryLevel());
+}
+
+void triggerCrime() {
+    Serial.println("\n🚨 CRIME DETECTED!");
+    ble.send("🚨 CRIME");
+    led.flash(255, 0, 0, 2);
+
+    // Siren: Aggressive fast sweep (Police Yelp)
+    for(int i=0; i<4; i++) {
+      for(int f=1000; f<=3500; f+=100) { 
+        tone(PIN_BUZZER, f, 15); delay(15); 
+      }
+    }
+
+    float lat, lon;
+    gpsManager.determineLocation(lat, lon, true);
+    emergency.trigger(EM_CRIME, lat, lon, getBatteryLevel());
+}
+
+void triggerSafe() {
+
+    // 👇 FIX 1: Instantly kill the GPS Refinement Watchdog!
+    needsGPSRefine = false;
+
+    // Only allow marking "SAFE" if an alert is currently active or retrying
+    if (emergency.getState() != EM_STATE_IDLE) {
+        Serial.println("\n✅ SAFE SIGNAL INITIATED!");
+        ble.send("✅ MARKED SAFE - Cancelling Alert...");
+        
+        // Flash Green to indicate safety
+        led.flash(0, 255, 0, 3);
+        
+        // Play a happy "All Clear" double-tone
+        tone(PIN_BUZZER, 1000, 150); delay(150);
+        tone(PIN_BUZZER, 2000, 150);
+        
+        float lat, lon;
+        gpsManager.determineLocation(lat, lon, true);
+        
+        // This will override the current emergency and broadcast EM_SAFE (0x04) to the Gateway!
+        emergency.trigger(EM_SAFE, lat, lon, getBatteryLevel());
+    } else {
+        Serial.println("\nℹ️ System is already idle. Safe signal ignored.");
+    }
+}
+
+
+void onGPSInject(float lat, float lon) {
+    gpsManager.injectBLE(lat, lon);
+}
+
+void onBLECommand(String cmd) {
+    Serial.printf("[BLE CMD]: %s\n", cmd.c_str());
+    handleCommand(cmd);
+}
+
+void handleCommand(String input) {
+    input.trim();
+    input.toLowerCase();
+    
+    int spaceIdx = input.indexOf(' ');
+    String cmd = (spaceIdx == -1) ? input : input.substring(0, spaceIdx);
+    String arg = (spaceIdx == -1) ? "" : input.substring(spaceIdx + 1);
+    
+    String response = "";
+    
+    if (cmd == "flood") { triggerFlood(); }
+    else if (cmd == "fire") { triggerFire(); }
+    else if (cmd == "crime") { triggerCrime(); }
+    else if (cmd == "send") { sendTestPacket(); }
+    else if (cmd == "gps") {
+        float lat, lon;
+        gpsManager.determineLocation(lat, lon, true);
+        response = "GPS: " + String(lat, 6) + ", " + String(lon, 6) + 
+                   " (" + gpsManager.getSourceName() + ")";
+    }
+    else if (cmd == "relay") {
+        if (arg == "on") {
+            router.setRelayEnabled(true);
+            storage.setRelayEnabled(true);
+            response = "Relay: ON";
+        } else if (arg == "off") {
+            router.setRelayEnabled(false);
+            storage.setRelayEnabled(false);
+            response = "Relay: OFF";
+        } else {
+            response = "Relay: " + String(router.getRelayEnabled() ? "ON" : "OFF");
+        }
+    }
+    else if (cmd == "uid") {
+        if (arg.length() > 0) {
+            nodeID = arg.substring(0, 5);  // Max 5 chars
+            storage.setNodeID(nodeID);
+            response = "UID saved: " + nodeID + " (reboot required)";
+        } else {
+            response = "Current UID: " + nodeID;
+        }
+    }
+    else if (cmd == "sf") {
+        if (arg.length() > 0) {
+            uint8_t sf = arg.toInt();
+            if (sf >= 7 && sf <= 12) {
+                storage.setSpreadingFactor(sf);
+                LoRa.setSpreadingFactor(sf);
+                response = "SF set to " + String(sf);
+            }
+        } else {
+            response = "Current SF: " + String(storage.getSpreadingFactor());
+        }
+    }
+    else if (cmd == "auto") {
+        if (arg == "on") {
+            autoMode = true;
+            response = "Auto mode: ON";
+        } else if (arg == "off") {
+            autoMode = false;
+            response = "Auto mode: OFF";
+        } else {
+            response = "Auto mode: " + String(autoMode ? "ON" : "OFF");
+        }
+    }
+    else if (cmd == "info") {
+        response = "=== NODE INFO ===\n";
+        response += "UID: " + nodeID + "\n";
+        response += "MAC: " + ble.getMacAddress() + "\n"; // 👇 ADD THIS LINE
+        response += "Relay: " + String(router.getRelayEnabled() ? "ON" : "OFF") + "\n";
+        response += "SF: " + String(storage.getSpreadingFactor()) + "\n";
+        response += "BLE: " + String(ble.isConnected() ? "Connected" : "Disconnected") + "\n";
+        response += "GPS: " + String(gpsManager.isGPSValid() ? "Valid" : "No Fix");
+    }
+    else if (cmd == "reboot") {
+        response = "Rebooting...";
+        Serial.println(response);
+        ble.send(response);
+        delay(1000);
+        ESP.restart();
+    }
+    else {
+        response = "Unknown: " + cmd;
+        printMenu();
+    }
+    
+    if (response != "") {
+        Serial.println(response);
+        ble.send(response);
+    }
+}
+
+void printMenu() {
+    Serial.println("\n--- COMMANDS ---");
+    Serial.println("flood | fire | crime | send");
+    Serial.println("gps | relay on/off | uid <id>");
+    Serial.println("sf <7-12> | auto on/off | info | reboot");
+}
+
+
+
+
+==================================================
+FILE: ble_terminal.h
+==================================================
+
+#ifndef BLE_TERMINAL_H
+#define BLE_TERMINAL_H
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <esp_mac.h>    
+#include "config.h"
+
+class BLETerminal {
+private:
+    BLEServer *pServer;
+    BLECharacteristic *pTxChar;
+    bool connected;
+    String deviceName;
+    
+    // Callback handlers (set by main)
+    void (*onGPSInject)(float, float);
+    void (*onCommand)(String);
+    
+public:
+    BLETerminal();
+    
+    void init(const char* nodeName);
+    void update();
+    
+    bool isConnected() const { return connected; }
+    void send(const String &msg);
+    
+    // 👇 ADD THIS LINE
+    String getMacAddress();
+    
+    // Register callbacks
+    void setGPSInjectCallback(void (*cb)(float, float));
+    void setCommandCallback(void (*cb)(String));
+    
+    // Called by BLE callbacks
+    void handleConnect();
+    void handleDisconnect();
+    void handleData(String data);
+};
+
+#endif
+
+
+==================================================
+FILE: config.h
+==================================================
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <Arduino.h>
+
+// === DEVICE ROLES (Uncomment ONLY one) ===
+#define ROLE_NODE
+// #define ROLE_REPEATER
+// #define ROLE_GATEWAY+-
+
+// === HARDWARE PINS ===
+#define PIN_BUZZER      9
+#define PIN_GPS_RX      RX //20
+#define PIN_GPS_TX      TX //21
+#define PIN_RGB         48
+
+// 👇 ADDED BATTERY PIN HERE
+#define PIN_BATTERY     3  // Safe ADC1 Pin for voltage reading
+
+// Buttons (Used on Node, optional on Repeater for test)
+#define PIN_BTN_FLOOD   1
+#define PIN_BTN_FIRE    2
+#define PIN_BTN_CRIME   4
+
+// LoRa SPI
+#define SCK_PIN         7
+#define MISO_PIN        5
+#define MOSI_PIN        6
+#define SS_PIN          10
+#define RST_PIN         11
+#define DIO0_PIN        -1
+
+// === LORA SETTINGS ===
+#define LORA_FREQ       433E6
+#define LORA_SF         11
+#define LORA_BW         125E3
+#define LORA_CR         8
+#define LORA_PREAMBLE   16
+#define LORA_SYNCWORD   0xF3
+#define LORA_TXPOWER    17  // Boosted to 20dBm for Repeater/Gateway
+
+// === PROTOCOL ===
+#define MAX_HOP         10
+
+// Adjust cache based on role
+#ifdef ROLE_REPEATER
+    #define DUPLICATE_CACHE_SIZE 60 // Remember more packets
+    #define RELAY_MIN_DELAY 200     // Faster relay
+    #define RELAY_MAX_DELAY 800
+#else
+    #define DUPLICATE_CACHE_SIZE 20
+    #define RELAY_MIN_DELAY 500
+    #define RELAY_MAX_DELAY 1500
+#endif
+
+#define ACK_TIMEOUT_MS  5000
+#define RETRY_INTERVAL_MS 8000
+#define MAX_RETRIES     3
+
+// === TIMING ===
+#define AUTO_MODE_INTERVAL  15000
+#define LED_UPDATE_INTERVAL 2000
+#define BLE_UPDATE_INTERVAL 3000  // ← ADD THIS LINE
+#define GPS_VALID_AGE_MS    5000  // ← ADD THIS LINE
+
+// === MESSAGE TYPES ===
+enum MsgType : uint8_t {
+    MSG_EMERGENCY = 0x01A,
+    MSG_HEARTBEAT = 0x02A,
+    MSG_ACK       = 0x0A,
+    MSG_TEST      = 0xFF
+};
+
+enum EmergencyType : uint8_t {
+    EM_NONE  = 0x00,
+    EM_FIRE  = 0x01,
+    EM_FLOOD = 0x02,
+    EM_CRIME = 0x03,
+    EM_SAFE  = 0x04
+};
+
+// === DEFAULTS ===
+#ifdef ROLE_REPEATER
+    #define DEFAULT_NODE_ID "REP01"
+#elif defined(ROLE_GATEWAY)
+    #define DEFAULT_NODE_ID "GTW01"
+#else
+    #define DEFAULT_NODE_ID "S3" //FOB01
+#endif
+
+#endif
+
+
+==================================================
+FILE: configc3.h
+==================================================
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <Arduino.h>
+
+// === DEVICE ROLES (Uncomment ONLY one) ===
+#define ROLE_NODE
+// #define ROLE_REPEATER
+// #define ROLE_GATEWAY
+
+// === HARDWARE PINS ===
+#define PIN_BUZZER      2
+#define PIN_GPS_RX      20
+#define PIN_GPS_TX      21
+#define PIN_RGB         9 // change back to pin 0 for esp32 s3
+// Buttons (Used on Node, optional on Repeater for test)
+#define PIN_BTN_FLOOD   3
+#define PIN_BTN_FIRE    1
+#define PIN_BTN_CRIME   10
+
+#define PIN_BATTERY     0   // Safe ADC1 Pin for voltage reading
+
+// LoRa SPI
+#define SCK_PIN         4
+#define MISO_PIN        5
+#define MOSI_PIN        6
+#define SS_PIN          7
+#define RST_PIN         8
+#define DIO0_PIN        -1
+
+// === LORA SETTINGS ===
+#define LORA_FREQ       433E6
+#define LORA_SF         11
+#define LORA_BW         125E3
+#define LORA_CR         8
+#define LORA_PREAMBLE   16
+#define LORA_SYNCWORD   0xF3
+#define LORA_TXPOWER    17  // Boosted to 20dBm for Repeater/Gateway
+
+// === PROTOCOL ===
+#define MAX_HOP         10
+
+// Adjust cache based on role
+#ifdef ROLE_REPEATER
+    #define DUPLICATE_CACHE_SIZE 60 // Remember more packets
+    #define RELAY_MIN_DELAY 200     // Faster relay
+    #define RELAY_MAX_DELAY 800
+#else
+    #define DUPLICATE_CACHE_SIZE 20
+    #define RELAY_MIN_DELAY 500
+    #define RELAY_MAX_DELAY 1500
+#endif
+
+#define ACK_TIMEOUT_MS  5000
+#define RETRY_INTERVAL_MS 8000
+#define MAX_RETRIES     3
+
+// === TIMING ===
+#define AUTO_MODE_INTERVAL  15000
+#define LED_UPDATE_INTERVAL 2000
+#define BLE_UPDATE_INTERVAL 3000  // ← ADD THIS LINE
+#define GPS_VALID_AGE_MS    5000  // ← ADD THIS LINE
+
+// === MESSAGE TYPES ===
+enum MsgType : uint8_t {
+    MSG_EMERGENCY = 0x01,
+    MSG_HEARTBEAT = 0x02,
+    MSG_ACK       = 0x0A,
+    MSG_TEST      = 0xFF
+};
+
+enum EmergencyType : uint8_t {
+    EM_NONE  = 0x00,
+    EM_FIRE  = 0x01,
+    EM_FLOOD = 0x02,
+    EM_CRIME = 0x03,
+    EM_SAFE  = 0x04
+};
+
+// === DEFAULTS ===
+#ifdef ROLE_REPEATER
+    #define DEFAULT_NODE_ID "REP01"
+#elif defined(ROLE_GATEWAY)
+    #define DEFAULT_NODE_ID "GTW01"
+#else
+    #define DEFAULT_NODE_ID "FOB01"
+#endif
+
+#endif
+
+
+==================================================
+FILE: emergency.h
+==================================================
+
+#ifndef EMERGENCY_H
+#define EMERGENCY_H
+
+#include <Arduino.h>
+#include "config.h"
+#include "packet.h"
+#include "ble_terminal.h" // Include this if not already in emergency.h
+
+enum EmergencyState {
+    EM_STATE_IDLE,
+    EM_STATE_SENDING,
+    EM_STATE_WAITING_ACK,
+    EM_STATE_CONFIRMED,
+    EM_STATE_FAILED
+};
+
+class EmergencyManager {
+private:
+    SafeChainPacket pendingPacket;
+    EmergencyState state;
+    uint8_t retryCount;
+    unsigned long lastSendTime;
+    const char* nodeID;
+    
+public:
+    EmergencyManager();
+    
+    void init(const char* id);
+    
+    // Trigger emergency send
+    void trigger(EmergencyType type, float lat, float lon, uint8_t batt);
+    
+    // Update state machine (call in loop)
+    void update();
+    
+    // Handle incoming ACK
+    void handleACK(const SafeChainPacket &ack);
+    
+    // Check if waiting for ACK
+    bool isWaiting() const { return state == EM_STATE_WAITING_ACK; }
+    
+    // Get current state
+    EmergencyState getState() const { return state; }
+    
+private:
+    void transmit();
+    void retry();
+    void fail();
+    void confirm();
+};
+
+#endif
+
+
+==================================================
+FILE: gps_manager.h
+==================================================
+
+#ifndef GPS_MANAGER_H
+#define GPS_MANAGER_H
+
+#include <Arduino.h>
+#include <TinyGPS++.h>
+#include "config.h"
+
+enum LocationSource {
+    LOC_NONE,
+    LOC_GPS_HARDWARE,
+    LOC_BLE_PHONE
+};
+
+class GPSManager {
+private:
+    TinyGPSPlus gps;
+    HardwareSerial *gpsSerial;
+    
+    // BLE injected coordinates
+    float bleLat;
+    float bleLon;
+    bool bleValid;
+    
+    // Final determined location
+    float finalLat;
+    float finalLon;
+    LocationSource source;
+    
+public:
+    GPSManager();
+    
+    void init();
+    void update();  // Read GPS serial
+    
+    // BLE GPS injection
+    void injectBLE(float lat, float lon);
+    
+    // Get best location
+    void determineLocation(float &lat, float &lon, bool verbose = false);
+    
+    // Status queries
+    bool isGPSValid() const;
+    LocationSource getSource() const { return source; }
+    const char* getSourceName() const;
+};
+
+#endif
+
+
+==================================================
+FILE: led_manager.h
+==================================================
+
+#ifndef LED_MANAGER_H
+#define LED_MANAGER_H
+
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+#include "config.h"
+
+class LEDManager {
+private:
+    Adafruit_NeoPixel strip;
+    
+public:
+    LEDManager();
+    
+    void init();
+    void setColor(int r, int g, int b);
+    void flash(int r, int g, int b, int times);
+    void updateStatus(bool bleConn, bool gpsValid);
+    void off();
+};
+
+#endif
+
+
+==================================================
+FILE: origconfig.h
+==================================================
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <Arduino.h>
+
+// === HARDWARE PINS (LOCKED) ===
+#define PIN_BUZZER      3
+#define PIN_GPS_RX      20
+#define PIN_GPS_TX      21
+#define PIN_RGB         2
+#define PIN_BTN_FLOOD   0
+#define PIN_BTN_FIRE    1
+#define PIN_BTN_CRIME   10
+
+// LoRa SPI
+#define SCK_PIN         4
+#define MISO_PIN        5
+#define MOSI_PIN        6
+#define SS_PIN          7
+#define RST_PIN         8
+#define DIO0_PIN        -1
+
+// === LORA SETTINGS ===
+#define LORA_FREQ       433E6
+#define LORA_SF         12
+#define LORA_BW         125E3
+#define LORA_CR         8
+#define LORA_PREAMBLE   16
+#define LORA_SYNCWORD   0xF3
+#define LORA_TXPOWER    20 // Boosted to 20dBm for repeater/gateway
+
+// === PROTOCOL ===
+#define MAX_HOP         3
+#define DUPLICATE_CACHE_SIZE 20
+#define ACK_TIMEOUT_MS  5000
+#define RETRY_INTERVAL_MS 8000
+#define MAX_RETRIES     3
+#define RELAY_MIN_DELAY 500
+#define RELAY_MAX_DELAY 1500
+
+// === TIMING ===
+#define AUTO_MODE_INTERVAL  15000
+#define LED_UPDATE_INTERVAL 2000
+#define BLE_UPDATE_INTERVAL 3000
+#define GPS_VALID_AGE_MS    5000
+
+// === MESSAGE TYPES ===
+enum MsgType : uint8_t {
+    MSG_EMERGENCY = 0x01,
+    MSG_HEARTBEAT = 0x02,
+    MSG_ACK       = 0x03,
+    MSG_TEST      = 0xFF
+};
+
+enum EmergencyType : uint8_t {
+    EM_NONE  = 0x00,
+    EM_FIRE  = 0x01,
+    EM_FLOOD = 0x02,
+    EM_CRIME = 0x03,
+    EM_SAFE  = 0x04
+};
+
+// === BLE ===
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHAR_UUID_RX        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHAR_UUID_TX        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// === DEFAULTS ===
+#define DEFAULT_NODE_ID     "FOB01"
+
+#endif
+
+
+==================================================
+FILE: packet.h
+==================================================
+
+#ifndef PACKET_H
+#define PACKET_H
+
+#include <Arduino.h>
+#include "config.h"
+
+struct __attribute__((packed)) SafeChainPacket {
+    char     srcID[6];      // "FOB01" + null terminator
+    uint8_t  msgType;       // MsgType enum
+    uint16_t seqNum;        // Sequence counter
+    float    latitude;      // Raw float (4 bytes)
+    float    longitude;     // Raw float (4 bytes)
+    uint8_t  hopCount;      // Current hop
+    uint8_t  maxHop;        // Limit (always 3)
+    uint8_t  battery;       // 0-100%
+    int16_t  rssi;  
+    uint16_t crc;           // CRC-16-CCITT
+};
+
+class PacketBuilder {
+public:
+    static uint16_t seqCounter;
+    
+    // Build new packet
+    static void build(SafeChainPacket &pkt, 
+                      const char* srcID,
+                      MsgType type,
+                      EmergencyType emType,
+                      float lat, float lon,
+                      uint8_t batt);
+    
+    // Build ACK response
+    static void buildACK(SafeChainPacket &pkt,
+                         const char* srcID,
+                         uint16_t ackSeqNum);
+    
+    // CRC calculation
+    static uint16_t calcCRC16(const uint8_t *data, uint16_t length);
+    
+    // Validation
+    static bool validate(const SafeChainPacket &pkt);
+    
+    // Relay preparation
+    static bool prepareRelay(SafeChainPacket &pkt);
+    
+    // Debug print
+    static void print(const SafeChainPacket &pkt);
+};
+
+#endif
+
+
+==================================================
+FILE: router.h
+==================================================
+
+#ifndef ROUTER_H
+#define ROUTER_H
+
+#include <Arduino.h>
+#include "config.h"
+#include "packet.h"
+
+class Router {
+private:
+    uint16_t seenCache[DUPLICATE_CACHE_SIZE];
+    uint8_t cacheIndex;
+    String myNodeID;
+    bool relayEnabled;
+    
+    // Pending relay state
+    SafeChainPacket pendingPacket;
+    bool isPending;
+    unsigned long relayTriggerTime;
+    
+public:
+    Router();
+    
+    void init(const char* nodeID, bool enableRelay);
+    void setRelayEnabled(bool enabled);
+    bool getRelayEnabled() const { return relayEnabled; }
+    
+    // Check if packet should be relayed
+    bool shouldRelay(const SafeChainPacket &pkt);
+    
+    // Queue packet for relay
+    void queueRelay(const SafeChainPacket &pkt);
+    
+    // Process pending relay (call in loop)
+    void update();
+    
+    // Cancel pending relay (for emergency override)
+    void cancelRelay();
+    
+private:
+    bool isDuplicate(uint16_t seqNum);
+    void markSeen(uint16_t seqNum);
+    bool isOwnPacket(const SafeChainPacket &pkt);
+};
+
+#endif
+
+
+==================================================
+FILE: storage.h
+==================================================
+
+#ifndef STORAGE_H
+#define STORAGE_H
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include "config.h"
+
+class Storage {
+private:
+    Preferences prefs;
+    
+public:
+    Storage();
+    
+    void init();
+    
+    // Node ID
+    String getNodeID();
+    void setNodeID(const String &id);
+    
+    // Relay mode
+    bool getRelayEnabled();
+    void setRelayEnabled(bool enabled);
+    
+    // Spreading Factor
+    uint8_t getSpreadingFactor();
+    void setSpreadingFactor(uint8_t sf);
+};
+
+#endif
+
+
+==================================================
+FILE: ble_terminal.cpp
+==================================================
+
+#include "ble_terminal.h"
+#include "config.h"
+
+static BLETerminal *bleInstance = nullptr;  // For callbacks
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        if (bleInstance) bleInstance->handleConnect();
+    }
+    void onDisconnect(BLEServer* pServer) {
+        if (bleInstance) bleInstance->handleDisconnect();
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pChar) {
+        String value = pChar->getValue();
+        if (bleInstance && value.length() > 0) {
+            bleInstance->handleData(value);
+        }
+    }
+};
+
+BLETerminal::BLETerminal() 
+    : pServer(nullptr), pTxChar(nullptr), connected(false),
+      onGPSInject(nullptr), onCommand(nullptr) {
+    bleInstance = this;
+}
+
+// 👇 ADD THIS NEW FUNCTION
+String BLETerminal::getMacAddress() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_BT); // Read directly from the hardware chip!
+    
+    char macStr[18];
+    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            
+    return String(macStr);
+}
+
+void BLETerminal::init(const char* nodeName) {
+    deviceName = String("SafeChain_") + nodeName;
+    
+    BLEDevice::init(deviceName.c_str());
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    // Nordic UART Service UUIDs (standard BLE UART)
+    BLEService *pService = pServer->createService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    
+    // RX Characteristic (Write from phone)
+    BLECharacteristic *pRx = pService->createCharacteristic(
+        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E",
+        BLECharacteristic::PROPERTY_WRITE);
+    pRx->setCallbacks(new MyCallbacks());
+    
+    // TX Characteristic (Notify to phone)
+    pTxChar = pService->createCharacteristic(
+        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E",
+        BLECharacteristic::PROPERTY_NOTIFY);
+    pTxChar->addDescriptor(new BLE2902());
+    
+    pService->start();
+    
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    pAdvertising->setScanResponse(true);
+
+    // 👇 ADD THIS LINE: Frees up 5 bytes in the packet so the Name fits!
+    pAdvertising->setMinPreferred(0x00);
+    
+    BLEDevice::startAdvertising();
+    
+    Serial.printf("✅ BLE Active: %s\n", deviceName.c_str());
+
+    // 👇 ADD THIS LINE TO PRINT THE MAC ON BOOT
+    Serial.printf("🔗 BLE MAC Address: %s\n", getMacAddress().c_str());
+}
+
+
+
+void BLETerminal::update() {
+    // Non-blocking BLE updates handled by callbacks
+}
+
+void BLETerminal::send(const String &msg) {
+    if (connected && pTxChar) {
+        pTxChar->setValue(msg.c_str());
+        pTxChar->notify();
+    }
+}
+
+void BLETerminal::setGPSInjectCallback(void (*cb)(float, float)) {
+    onGPSInject = cb;
+}
+
+void BLETerminal::setCommandCallback(void (*cb)(String)) {
+    onCommand = cb;
+}
+
+void BLETerminal::handleConnect() {
+    connected = true;
+    Serial.println("\n>>> BLE: Connected");
+    tone(PIN_BUZZER, 4000, 100);
+}
+
+void BLETerminal::handleDisconnect() {
+    connected = false;
+    Serial.println("\n>>> BLE: Disconnected");
+    BLEDevice::startAdvertising();
+}
+
+void BLETerminal::handleData(String data) {
+    int commaIndex = data.indexOf(',');
+    
+    // Check if GPS injection: "lat,lon"
+    if (commaIndex > 0 && data.indexOf('.') > 0) {
+        float lat = data.substring(0, commaIndex).toFloat();
+        float lon = data.substring(commaIndex + 1).toFloat();
+        
+        if (onGPSInject) onGPSInject(lat, lon);
+    } else {
+        // Command
+        if (onCommand) onCommand(data);
+    }
+}
+
+
+==================================================
+FILE: emergency.cpp
+==================================================
+
+#include "emergency.h"
+#include <LoRa.h>
+#include <OneButton.h>
+
+// 👇 Bring the buttons over from the main file!
+extern OneButton btnFlood;
+extern OneButton btnFire;
+extern OneButton btnCrime;
+
+extern void flashRGB(int r, int g, int b, int times);  // Forward declare
+extern BLETerminal ble;                                // Forward declare BLE for terminal messages
+
+EmergencyManager::EmergencyManager() 
+    : state(EM_STATE_IDLE), retryCount(0), lastSendTime(0) {}
+
+void EmergencyManager::init(const char* id) {
+    nodeID = id;
+}
+
+void EmergencyManager::trigger(EmergencyType type, float lat, float lon, uint8_t batt) {
+    PacketBuilder::build(pendingPacket, nodeID, MSG_EMERGENCY, 
+                         type, lat, lon, batt);
+    
+    // If it is a SAFE signal, "Fire and Forget"!
+    if (type == EM_SAFE) {
+        Serial.println("📡 SENDING: Safe Signal Broadcast");
+        
+        // Rapid-fire 3 times to guarantee delivery without waiting for ACKs
+        for(int i = 0; i < 3; i++) {
+            LoRa.beginPacket();
+            LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
+            LoRa.endPacket();
+            delay(100); 
+        }
+        LoRa.receive();
+        
+        // INSTANTLY kill the emergency loop and silence the Node
+        state = EM_STATE_IDLE; 
+        
+    } else {
+        // Normal Emergency (Wait for ACK and run retry loops)
+        state = EM_STATE_SENDING;
+        retryCount = 0;
+        transmit();
+    }
+}
+
+void EmergencyManager::transmit() {
+    String statusMsg = "📡 SENDING: Seq " + String(pendingPacket.seqNum);
+    Serial.println(statusMsg);
+    ble.send(statusMsg);
+    
+    // 1. ALARMS FIRST (Isolate the power draw)
+    tone(PIN_BUZZER, 4000, 100); 
+    delay(100); // Let the buzzer completely finish
+    
+    // Use a low-power color (Dim Cyan) instead of maximum-power White!
+    flashRGB(0, 50, 50, 2); 
+    
+    // 2. TRANSMIT SECOND (Now 100% of the battery power can go to the LoRa antenna)
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
+    LoRa.endPacket(); // Blocking send
+    
+    LoRa.receive(); // Turn ears back on
+    
+    state = EM_STATE_WAITING_ACK;
+    lastSendTime = millis();
+
+
+    // String statusMsg = "📡 SENDING: Seq " + String(pendingPacket.seqNum);
+    // Serial.println(statusMsg);
+    // ble.send(statusMsg);
+    
+    // // 👇 LOUD, PIERCING BEEP FOR SENDING (High 4000Hz tone)
+    // tone(PIN_BUZZER, 4000, 200); 
+    
+    // flashRGB(255, 255, 255, 2);  // White flash
+    
+    // LoRa.beginPacket();
+    // LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
+    // LoRa.endPacket();  // Blocking send
+    
+    // LoRa.receive();    // Turn ears back on to listen for ACK
+    
+    // state = EM_STATE_WAITING_ACK;
+    // lastSendTime = millis();
+    
+}
+
+void EmergencyManager::update() {
+    if (state != EM_STATE_WAITING_ACK) return;
+    
+    // Check timeout
+    if (millis() - lastSendTime > ACK_TIMEOUT_MS) {
+        retry();
+    }
+}
+
+void EmergencyManager::retry() {
+    if (retryCount < MAX_RETRIES) {
+        retryCount++;
+        
+        // Exponential backoff with jitter
+        uint32_t minDelay = 4000 * (1 << (retryCount - 1));
+        uint32_t maxDelay = minDelay * 2;
+        uint32_t backoff = random(minDelay, maxDelay);
+        
+        String retryMsg = "⚠️ RETRY " + String(retryCount) + "/" + String(MAX_RETRIES) + 
+                          " (Wait: " + String(backoff / 1000) + "s)";
+        Serial.println(retryMsg);
+        ble.send(retryMsg);
+        
+        flashRGB(255, 100, 0, 2); // Orange flash
+        
+        // 👇 THE NEW HEARTBEAT TIMER LOOP
+        unsigned long startWait = millis();
+        while (millis() - startWait < backoff) {
+            // "Ba-bum" heartbeat sound (Low 800Hz tone)
+            tone(PIN_BUZZER, 800, 50);
+            delay(100);
+            
+            // Check if time is up before the second beat
+            if (millis() - startWait >= backoff) break;
+            tone(PIN_BUZZER, 800, 50); 
+            
+            // Gap between heartbeats (approx 850ms)
+            unsigned long gapStart = millis();
+            while (millis() - gapStart < 850) {
+                
+                // 👇 FIX 2: Keep the buttons alive while waiting!
+                btnFlood.tick();
+                btnFire.tick();
+                btnCrime.tick();
+                
+                // If the user double-clicked SAFE, triggerSafe() instantly sets 
+                // the state to IDLE. If we see IDLE, abort the retry immediately!
+                if (state == EM_STATE_IDLE) return; 
+
+                if (millis() - startWait >= backoff) break;
+                delay(10);
+            }
+        }
+        
+        // Final safety catch just in case it was pressed at the last millisecond
+        if (state == EM_STATE_IDLE) return;
+        
+        // Generate new sequence number
+        pendingPacket.seqNum = PacketBuilder::seqCounter++;
+        pendingPacket.crc = PacketBuilder::calcCRC16((uint8_t*)&pendingPacket, sizeof(SafeChainPacket) - 2);
+        
+        transmit();
+    } else {
+        fail();
+    }
+}
+
+void EmergencyManager::fail() {
+    Serial.println(">>> FAILED - No ACK after retries");
+    // Send failure to the Bluetooth Terminal
+    ble.send("❌ FAILED - No network acknowledgment received.");
+    flashRGB(255, 0, 0, 5);  // Red
+    // Sad "Failed" Low-Beep (from our previous buzzer upgrade)
+    tone(PIN_BUZZER, 500, 1000);    
+    state = EM_STATE_FAILED;
+}
+
+void EmergencyManager::confirm() {
+    Serial.println(">>> ACK RECEIVED - SUCCESS!");
+    // Send success to the Bluetooth Terminal
+    ble.send("✅ ALERT CONFIRMED - Help is on the way!");
+    flashRGB(0, 255, 0, 3);  // Green
+    // Happy "Success" Double-Beep (from our previous buzzer upgrade)
+    tone(PIN_BUZZER, 2500, 150); delay(200);
+    state = EM_STATE_CONFIRMED;
+}
+
+void EmergencyManager::handleACK(const SafeChainPacket &ack) {
+    if (state != EM_STATE_WAITING_ACK) return;
+    if (ack.seqNum != pendingPacket.seqNum) return;
+    
+    confirm();
+}
+
+
+==================================================
+FILE: gps_manager.cpp
+==================================================
+
+#include "gps_manager.h"
+#include "config.h"
+
+GPSManager::GPSManager() 
+    : bleLat(0), bleLon(0), bleValid(false),
+      finalLat(0), finalLon(0), source(LOC_NONE) {
+    gpsSerial = new HardwareSerial(1);
+}
+
+void GPSManager::init() {
+    gpsSerial->begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    Serial.println("✅ GPS Manager Ready");
+}
+
+void GPSManager::update() {
+    while (gpsSerial->available() > 0) {
+        gps.encode(gpsSerial->read());
+    }
+}
+
+void GPSManager::injectBLE(float lat, float lon) {
+    bleLat = lat;
+    bleLon = lon;
+    bleValid = true;
+    Serial.printf(">>> BLE GPS Injected: %.6f, %.6f\n", lat, lon);
+}
+
+void GPSManager::determineLocation(float &lat, float &lon, bool verbose) {
+    // Priority 1: Hardware GPS (fresh)
+    if (gps.location.isValid() && gps.location.age() < GPS_VALID_AGE_MS) {
+        finalLat = gps.location.lat();
+        finalLon = gps.location.lng();
+        source = LOC_GPS_HARDWARE;
+        if (verbose) Serial.printf("GPS: %.6f, %.6f\n", finalLat, finalLon);
+    }
+    // Priority 2: BLE Phone GPS
+    else if (bleValid) {
+        finalLat = bleLat;
+        finalLon = bleLon;
+        source = LOC_BLE_PHONE;
+        if (verbose) Serial.printf("BLE GPS: %.6f, %.6f\n", finalLat, finalLon);
+    }
+    // Fallback: None
+    else {
+        finalLat = 0.0;
+        finalLon = 0.0;
+        source = LOC_NONE;
+        if (verbose) Serial.println("No Location Available");
+    }
+    
+    lat = finalLat;
+    lon = finalLon;
+}
+
+bool GPSManager::isGPSValid() const {
+    return gps.location.isValid();
+}
+
+const char* GPSManager::getSourceName() const {
+    switch(source) {
+        case LOC_GPS_HARDWARE: return "GPS";
+        case LOC_BLE_PHONE: return "BLE";
+        default: return "NONE";
+    }
+}
+
+
+==================================================
+FILE: led_manager.cpp
+==================================================
+
+#include "led_manager.h"
+
+LEDManager::LEDManager() : strip(1, PIN_RGB, NEO_GRB + NEO_KHZ800) {}
+
+void LEDManager::init() {
+    strip.begin();
+    strip.setBrightness(50);
+    off();
+}
+
+void LEDManager::setColor(int r, int g, int b) {
+    strip.setPixelColor(0, strip.Color(r, g, b));
+    strip.show();
+}
+
+void LEDManager::flash(int r, int g, int b, int times) {
+    for (int i = 0; i < times; i++) {
+        setColor(r, g, b);
+        delay(100);
+        off();
+        delay(100);
+    }
+}
+
+void LEDManager::updateStatus(bool bleConn, bool gpsValid) {
+    if (bleConn) setColor(0, 0, 50);        // Dim Blue
+    else if (gpsValid) setColor(0, 50, 0);  // Dim Green
+    else off();
+}
+
+void LEDManager::off() {
+    setColor(0, 0, 0);
+}
+
+
+==================================================
+FILE: packet.cpp
+==================================================
+
+#include "packet.h"
+
+uint16_t PacketBuilder::seqCounter = 0;
+
+void PacketBuilder::build(SafeChainPacket &pkt, 
+                          const char* srcID,
+                          MsgType type,
+                          EmergencyType emType,
+                          float lat, float lon,
+                          uint8_t batt) {
+    memset(&pkt, 0, sizeof(SafeChainPacket));
+    strncpy(pkt.srcID, srcID, 5);
+    pkt.srcID[5] = '\0';
+    
+    pkt.msgType = (type == MSG_EMERGENCY) ? emType : type;
+    pkt.seqNum = seqCounter++;
+    pkt.latitude = lat;
+    pkt.longitude = lon;
+    pkt.hopCount = 0;
+    pkt.maxHop = MAX_HOP;
+    pkt.battery = batt;
+    pkt.rssi = 0;  // ← ADD THIS LINE (Filled by receiver)
+    
+    // Calculate CRC (exclude CRC field itself)
+    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+}
+
+void PacketBuilder::buildACK(SafeChainPacket &pkt,
+                             const char* srcID,
+                             uint16_t ackSeqNum) {
+    memset(&pkt, 0, sizeof(SafeChainPacket));
+    strncpy(pkt.srcID, srcID, 5);
+    pkt.msgType = MSG_ACK;
+    pkt.seqNum = ackSeqNum;  // Echo back
+    pkt.hopCount = 0;
+    pkt.maxHop = MAX_HOP;
+    pkt.battery = 100;
+    pkt.rssi = 0; // added
+    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+}
+
+uint16_t PacketBuilder::calcCRC16(const uint8_t *data, uint16_t length) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+bool PacketBuilder::validate(const SafeChainPacket &pkt) {
+    uint16_t expected = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+    return (pkt.crc == expected);
+}
+
+bool PacketBuilder::prepareRelay(SafeChainPacket &pkt) {
+    if (pkt.hopCount >= pkt.maxHop) return false;
+    
+    pkt.hopCount++;
+    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+    return true;
+}
+
+void PacketBuilder::print(const SafeChainPacket &pkt) {
+    Serial.printf("[PKT] ID:%s Type:%02X Seq:%u Hop:%u/%u Lat:%.6f Lon:%.6f Batt:%u%%\n",
+        pkt.srcID, pkt.msgType, pkt.seqNum, pkt.hopCount, pkt.maxHop,
+        pkt.latitude, pkt.longitude, pkt.battery);
+}
+
+
+==================================================
+FILE: router.cpp
+==================================================
+
+#include "router.h"
+#include <LoRa.h>
+
+Router::Router() : cacheIndex(0), relayEnabled(false), isPending(false) {
+    memset(seenCache, 0, sizeof(seenCache));
+}
+
+void Router::init(const char* nodeID, bool enableRelay) {
+    myNodeID = String(nodeID);
+    relayEnabled = enableRelay;
+}
+
+void Router::setRelayEnabled(bool enabled) {
+    relayEnabled = enabled;
+}
+
+bool Router::shouldRelay(const SafeChainPacket &pkt) {
+    if (!relayEnabled) return false;
+    if (isOwnPacket(pkt)) return false;
+    if (isDuplicate(pkt.seqNum)) return false;
+    if (pkt.hopCount >= pkt.maxHop) return false;
+    if (pkt.msgType == MSG_ACK) return false;  // Don't relay ACKs
+    
+    return true;
+}
+
+void Router::queueRelay(const SafeChainPacket &pkt) {
+    memcpy(&pendingPacket, &pkt, sizeof(SafeChainPacket));
+    
+    // Prepare for relay (increment hop, update CRC)
+    if (!PacketBuilder::prepareRelay(pendingPacket)) {
+        Serial.println(">>> Relay prep failed (max hop)");
+        return;
+    }
+    
+    markSeen(pkt.seqNum);
+    
+    // Random backoff
+    relayTriggerTime = millis() + random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
+    isPending = true;
+    
+    Serial.printf(">>> Queued relay: Seq=%u (Wait %lums)\n", 
+        pkt.seqNum, relayTriggerTime - millis());
+}
+
+void Router::update() {
+    if (!isPending) return;
+    if (millis() < relayTriggerTime) return;
+    
+    Serial.println(">>> RELAYING NOW...");
+    
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
+    LoRa.endPacket();  // Async // removed true
+    
+    isPending = false;
+    Serial.printf(">>> RELAY SENT: Seq=%u Hop=%u\n", 
+        pendingPacket.seqNum, pendingPacket.hopCount);
+}
+
+void Router::cancelRelay() {
+    if (isPending) {
+        Serial.println("!!! CANCELLING RELAY FOR EMERGENCY !!!");
+        isPending = false;
+    }
+}
+
+bool Router::isDuplicate(uint16_t seqNum) {
+    for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
+        if (seenCache[i] == seqNum) return true;
+    }
+    return false;
+}
+
+void Router::markSeen(uint16_t seqNum) {
+    seenCache[cacheIndex] = seqNum;
+    cacheIndex = (cacheIndex + 1) % DUPLICATE_CACHE_SIZE;
+}
+
+bool Router::isOwnPacket(const SafeChainPacket &pkt) {
+    return (myNodeID == String(pkt.srcID));
+}
+
+
+==================================================
+FILE: storage.cpp
+==================================================
+
+#include "storage.h"
+
+Storage::Storage() {}
+
+void Storage::init() {
+    prefs.begin("safechain", false);
+}
+
+String Storage::getNodeID() {
+    return prefs.getString("uid", DEFAULT_NODE_ID);
+}
+
+void Storage::setNodeID(const String &id) {
+    prefs.putString("uid", id.c_str());
+}
+
+bool Storage::getRelayEnabled() {
+    return prefs.getBool("relay", false);
+}
+
+void Storage::setRelayEnabled(bool enabled) {
+    prefs.putBool("relay", enabled);
+}
+
+uint8_t Storage::getSpreadingFactor() {
+    return prefs.getUChar("sf", LORA_SF);
+}
+
+void Storage::setSpreadingFactor(uint8_t sf) {
+    prefs.putUChar("sf", sf);
+}
+
