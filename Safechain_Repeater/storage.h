@@ -4,27 +4,54 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "config.h"
+#include "safechain_protocol.h"
+
+struct NodeEventRecord {
+    uint32_t magic;
+    uint32_t event_id;
+    uint8_t  event_type;
+    uint16_t attempt;
+    uint8_t  state;       // 1=pending_ack, 2=acked, 3=cleared
+    uint8_t  battery_pct;
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+    uint32_t created_ms;
+    uint32_t updated_ms;
+    uint16_t crc16;
+};
 
 class Storage {
 private:
     Preferences prefs;
-    
+
 public:
     Storage();
-    
     void init();
-    
-    // Node ID
-    String getNodeID();
-    void setNodeID(const String &id);
-    
-    // Relay mode
-    bool getRelayEnabled();
-    void setRelayEnabled(bool enabled);
-    
-    // Spreading Factor
+
+    String  getNodeID();
+    void    setNodeID(const String &id);
+
+    bool    getRelayEnabled();
+    void    setRelayEnabled(bool enabled);
+
     uint8_t getSpreadingFactor();
-    void setSpreadingFactor(uint8_t sf);
+    void    setSpreadingFactor(uint8_t sf);
+
+    uint32_t getEventCounter();
+    uint32_t nextEventCounter();
+    void     setEventCounter(uint32_t value);
+
+    bool savePendingEvent(const NodeEventRecord &record);
+    bool loadPendingEvent(NodeEventRecord &record);
+    void clearPendingEvent();
+    bool hasPendingEvent();
+
+    // [M3] PSK storage — 16-byte pre-shared key for HMAC authentication
+    // Default: sc::PSK_DEFAULT ("SafeChain_Dev01")
+    // Provision via: setpsk <32 hex chars>
+    void getPSK(uint8_t* out, size_t len);
+    void setPSK(const uint8_t* key, size_t len);
+    bool hasPSK(); // returns true if a custom key has been provisioned
 };
 
 #endif

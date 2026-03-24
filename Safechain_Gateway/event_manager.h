@@ -2,89 +2,118 @@
 #define EVENT_MANAGER_H
 
 #include <Arduino.h>
+#include <LoRa.h>
+#include "safechain_protocol.h"
+#include "gateway_journal.h"
 #include "config.h"
-#include "packet.h"
 
-struct EmergencyDedup {
-    char srcID[6];
-    uint8_t msgType;
-    unsigned long timestamp;
+// ============================================================
+// [M5] NodeRegistry — tracks liveness of all known nodes.
+//
+// A node is registered the first time any V1 frame arrives
+// from it (EVENT or HEARTBEAT). Its last_seen_ms is updated
+// on every subsequent frame. The gateway runs a periodic
+// check and transitions status to OFFLINE when silence
+// exceeds NODE_OFFLINE_THRESHOLD_MS.
+// ============================================================
+enum NodeStatus : uint8_t {
+    NODE_UNKNOWN = 0,
+    NODE_ONLINE  = 1,
+    NODE_OFFLINE = 2
 };
 
-struct EmergencyEvent {
-    uint32_t eventID;
-    char srcID[6];
-    uint8_t msgType;
-    uint16_t seqNum;
-    float latitude;
-    float longitude;
-    uint8_t hopCount;
-    uint8_t battery;
-    int16_t rssi;
-    unsigned long timestamp;
-    bool active;
+struct NodeRecord {
+    bool     used;
+    char     origin_id[sc::DEVICE_ID_LEN];
+    unsigned long last_seen_ms;
+    uint8_t  last_battery;
+    int16_t  last_rssi;
+    NodeStatus status;
+    uint32_t frames_received;
+    uint32_t heartbeats_received;
 };
 
-struct NodeStats {
-    char nodeID[6];
-    uint16_t lastSeq;
-    uint16_t packetsReceived;
-    uint16_t packetsMissed;
-    unsigned long lastSeen;
-    int16_t avgRSSI;
-    float avgHops;
+static const uint8_t MAX_NODES = 20;
+
+class NodeRegistry {
+private:
+    NodeRecord nodes[MAX_NODES];
+    uint8_t    count;
+
+public:
+    NodeRegistry();
+    void init();
+
+    // Update or register a node — called on every received V1 frame
+    void update(const char* originId, int16_t rssi, uint8_t battery,
+                bool isHeartbeat);
+
+    // Check all nodes for offline status — call every NODE_OFFLINE_CHECK_MS
+    void checkOffline();
+
+    // Print all known nodes to Serial
+    void printAll() const;
+
+    uint8_t size() const { return count; }
+    const NodeRecord* getRecord(uint8_t idx) const;
 };
+
 
 class EventManager {
 private:
-    EmergencyEvent events[MAX_EVENTS];
-    uint8_t eventIndex;
-    
-    NodeStats nodes[40];  // Track up to 10 nodes
-    uint8_t nodeCount;
+    GatewayJournal journal;
+    NodeRegistry   nodeReg;    // [M5]
 
-    struct CacheEntry {
-        char srcID[6];
-        uint16_t seqNum;
-    };
-    CacheEntry seenCache[DUPLICATE_CACHE_SIZE];
-    uint8_t cacheIndex;
-    
-    // --- NEW: 30-Second Deduplication Tracking ---
-    EmergencyDedup recentEmergencies[40];
-    uint8_t dedupIndex;
-    static const uint32_t DEDUP_WINDOW_MS = 30000;  // 30 seconds
-    // ---------------------------------------------
-    
-    // Statistics
     uint32_t totalPackets;
     uint32_t duplicatePackets;
     uint32_t corruptedPackets;
-    
+    uint32_t ackSent;
+    uint32_t journaledEvents;
+    uint32_t replayedEvents;
+    uint32_t heartbeatsReceived; // [M5]
+
+    // [M0-3] Non-blocking ACK scheduling
+    bool                 pendingAckValid;
+    sc::SafeChainFrameV1 pendingAckFrame;
+    unsigned long        ackScheduledAt;
+    uint32_t             ackDelayMs;
+
+    // [M3] PSK for building ACK frames
+    uint8_t psk[sc::PSK_LEN];
+    size_t  pskLen;
+
+    // [M5] Offline check timer
+    unsigned long lastOfflineCheckMs;
+
+    const char* getEventTypeNameV1(uint8_t eventType);
+    void        printEventAlert(const sc::SafeChainFrameV1 &frame);
+    void        printEventAlertFromRecord(const GatewayJournalRecord &rec);
+
+    // [M5] Handle a received heartbeat frame
+    void handleHeartbeat(const sc::SafeChainFrameV1 &frame);
+
 public:
     EventManager();
-    
+
     void init();
-    bool processPacket(SafeChainPacket &pkt);
-    void sendACK(const SafeChainPacket &pkt);
-    void displayAlert(const SafeChainPacket &pkt);
-    void logCSV(const SafeChainPacket &pkt);
+    void replayUncommitted();
+
+    // Must be called every loop() tick
+    void update();
+
+    // V1 path — now handles FRAME_EVENT, FRAME_HEARTBEAT, ignores FRAME_ACK
+    bool processFrameV1(sc::SafeChainFrameV1 &frame);
+
+    void scheduleAckV1(const sc::SafeChainFrameV1 &frame);
+
+    void reloadPSK(const uint8_t* key, size_t len);
+
+    bool hostCommit(const char* originId, uint32_t eventId);
+
     void printStats();
-    void printPDR();
-    
-private:
-    bool isDuplicate(const char* srcID, uint16_t seqNum);
-    void markSeen(const char* srcID, uint16_t seqNum);
-    
-    // --- NEW: Deduplication Logic Handlers ---
-    bool isRecentDuplicate(const SafeChainPacket &pkt);
-    void markRecentEmergency(const SafeChainPacket &pkt);
-    // -----------------------------------------
-    
-    void storeEvent(const SafeChainPacket &pkt);
-    void updateNodeStats(const SafeChainPacket &pkt);
-    NodeStats* findNode(const char* nodeID);
-    const char* getTypeName(uint8_t type);
+
+    // [M5] Print node registry table
+    void printNodes() const;
 };
 
 #endif

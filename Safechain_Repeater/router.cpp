@@ -1,150 +1,186 @@
 #include "router.h"
 #include <LoRa.h>
+#include <string.h>
+#include "debug_log.h"
 
-RepeaterRouter::RepeaterRouter() 
-    : cacheIndex(0), isPending(false), 
-      packetsReceived(0), packetsRelayed(0), packetsDropped(0) {
-    memset(seenCache, 0, sizeof(seenCache));
-     memset(recentEmergencies, 0, sizeof(recentEmergencies)); // <-- ADD THIS
+// [M4] Legacy SafeChainPacket path removed entirely.
+// All relay logic is now V1 (SafeChainFrameV1) only.
+
+RepeaterRouter::RepeaterRouter()
+    : v1SeenIndex(0),
+      pendingV1Valid(false),
+      pendingV1ScheduledAt(0),
+      pendingV1DelayMs(0),
+      pendingV1QueuedAt(0),
+      pskLen(sc::PSK_LEN),
+      packetsReceived(0),
+      packetsRelayed(0),
+      packetsDropped(0),
+      duplicatesDropped(0),
+      ttlExpired(0) {
+    memset(ownNodeID, 0, sizeof(ownNodeID));
+    memset(v1Seen,    0, sizeof(v1Seen));
+    memset(&pendingV1, 0, sizeof(pendingV1));
+    // Default dev PSK — overwritten by reloadPSK() after storage.init()
+    memcpy(psk, sc::PSK_DEFAULT, sc::PSK_LEN);
 }
 
-void RepeaterRouter::init() {
-    Serial.println("✅ Repeater Router Ready");
+// [M0-5] Store NVS-sourced node ID
+void RepeaterRouter::init(const char* nodeId) {
+    strncpy(ownNodeID, nodeId, sc::DEVICE_ID_LEN - 1);
+    ownNodeID[sc::DEVICE_ID_LEN - 1] = '\0';
+    pendingV1Valid = false;
+    Serial.printf(">>> RepeaterRouter (V1-only): ownNodeID='%s'\n", ownNodeID);
 }
 
-extern void notifyBLE(String msg);
+// [M3] Update PSK cache
+void RepeaterRouter::reloadPSK(const uint8_t* key, size_t len) {
+    if (len > sc::PSK_LEN) len = sc::PSK_LEN;
+    memcpy(psk, key, len);
+    pskLen = len;
+    Serial.println(">>> Router PSK updated");
+}
 
-bool RepeaterRouter::shouldRelay(const SafeChainPacket &pkt) {
+// ---------------------------------------------------------------------------
+// V1 duplicate cache
+// ---------------------------------------------------------------------------
+bool RepeaterRouter::isDuplicateV1(const sc::SafeChainFrameV1 &frame) {
+    for (uint8_t i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
+        if (!v1Seen[i].used) continue;
+        if (strncmp(v1Seen[i].originID, frame.origin_id, sc::DEVICE_ID_LEN) == 0 &&
+            v1Seen[i].eventId   == frame.event_id &&
+            v1Seen[i].frameType == frame.frame_type)
+            return true;
+    }
+    return false;
+}
+
+void RepeaterRouter::markSeenV1(const sc::SafeChainFrameV1 &frame) {
+    strncpy(v1Seen[v1SeenIndex].originID, frame.origin_id, sc::DEVICE_ID_LEN);
+    v1Seen[v1SeenIndex].originID[sc::DEVICE_ID_LEN - 1] = '\0';
+    v1Seen[v1SeenIndex].eventId   = frame.event_id;
+    v1Seen[v1SeenIndex].frameType = frame.frame_type;
+    v1Seen[v1SeenIndex].used      = true;
+    v1SeenIndex = (v1SeenIndex + 1) % DUPLICATE_CACHE_SIZE;
+}
+
+// ---------------------------------------------------------------------------
+// shouldRelayV1
+// ---------------------------------------------------------------------------
+bool RepeaterRouter::shouldRelayV1(const sc::SafeChainFrameV1 &frame) {
     packetsReceived++;
-    
-    // 👇 FIX: Now we check ID, Sequence, AND the Message Type!
-    if (isDuplicate(pkt.srcID, pkt.seqNum, pkt.msgType)) {
-        Serial.println(">>> Duplicate detected");
-        if (isPending && pendingPacket.seqNum == pkt.seqNum) {
-            Serial.println(">>> SMART CANCEL: Overheard another repeater.");
-            notifyBLE("🛑 CANCELLED: Overheard Repeater relaying Seq " + String(pkt.seqNum));
-            isPending = false; 
-        }
+
+    // [M0-5] Filter by sender_id (our last-hop ID)
+    if (strncmp(frame.sender_id, ownNodeID, sc::DEVICE_ID_LEN) == 0) {
         packetsDropped++;
         return false;
     }
-    
-    // 2. Handle ACKs (CRITICAL: Do NOT return false here!)
-    if (pkt.msgType == MSG_ACK) {
-        Serial.println(">>> Overheard ACK flowing to Node");
-        notifyBLE("✅ HEARD ACK: Gateway confirmed Seq " + String(pkt.seqNum));
-        
-        if (isPending && pendingPacket.seqNum == pkt.seqNum) {
-            Serial.println(">>> SMART CANCEL: Gateway already ACKed this!");
-            notifyBLE("🛑 CANCELLED: Gateway already ACKed Seq " + String(pkt.seqNum));
-            isPending = false; 
+
+    if (isDuplicateV1(frame)) {
+        duplicatesDropped++;
+        packetsDropped++;
+        LOGD(">>> Dup V1: origin=%s event=%lu\n",
+            frame.origin_id, (unsigned long)frame.event_id);
+        // Smart cancel: if we already queued this exact frame, drop it too
+        if (pendingV1Valid &&
+            strncmp(pendingV1.origin_id, frame.origin_id, sc::DEVICE_ID_LEN) == 0 &&
+            pendingV1.event_id   == frame.event_id &&
+            pendingV1.frame_type == frame.frame_type) {
+            LOGD(">>> SMART CANCEL V1 pending relay\n");
+            pendingV1Valid = false;
         }
-        // Notice we do NOT return false here. The Repeater MUST relay the ACK!
+        return false;
     }
-    
-    // 3. Check hop limit
-    if (pkt.hopCount >= pkt.maxHop) {
-        Serial.println(">>> Max hop reached");
+
+    if (frame.hop_count >= frame.max_hops) { packetsDropped++; return false; }
+
+    // [M5] Allow FRAME_HEARTBEAT relay so gateway can track node liveness
+    if (!(frame.frame_type == sc::FRAME_EVENT  ||
+          frame.frame_type == sc::FRAME_ACK    ||
+          frame.frame_type == sc::FRAME_HEARTBEAT)) {
         packetsDropped++;
         return false;
     }
-    
+
     return true;
 }
 
-bool RepeaterRouter::isRecentEmergency(const SafeChainPacket &pkt) {
-    // Only apply to emergencies
-    if (pkt.msgType < EM_FIRE || pkt.msgType > EM_CRIME) {
-        return false;
-    }
-    
-    for (int i = 0; i < 10; i++) {
-        if (strcmp(recentEmergencies[i].srcID, pkt.srcID) == 0 &&
-            recentEmergencies[i].msgType == pkt.msgType &&
-            (millis() - recentEmergencies[i].timestamp) < 30000) {
-            return true;
-        }
-    }
-    return false;
-}
+// ---------------------------------------------------------------------------
+// queueRelayV1
+// ---------------------------------------------------------------------------
+void RepeaterRouter::queueRelayV1(const sc::SafeChainFrameV1 &frame) {
+    pendingV1 = frame;
 
-void RepeaterRouter::markRecentEmergency(const SafeChainPacket &pkt) {
-    // Only mark emergencies
-    if (pkt.msgType >= EM_FIRE && pkt.msgType <= EM_CRIME) {
-        strncpy(recentEmergencies[dedupIndex].srcID, pkt.srcID, 5);
-        recentEmergencies[dedupIndex].srcID[5] = '\0'; // Ensure null termination
-        recentEmergencies[dedupIndex].msgType = pkt.msgType;
-        recentEmergencies[dedupIndex].timestamp = millis();
-        dedupIndex = (dedupIndex + 1) % 10;
-    }
-}
-
-void RepeaterRouter::queueRelay(const SafeChainPacket &pkt) {
-    memcpy(&pendingPacket, &pkt, sizeof(SafeChainPacket));
-    
-    if (!PacketBuilder::prepareRelay(pendingPacket)) {
+    // [M0-5] Use ownNodeID as new sender for this hop
+    if (!sc::Protocol::prepareRelay(pendingV1, ownNodeID, psk, pskLen)) {
         packetsDropped++;
         return;
     }
-    
-    markSeen(pkt.srcID, pkt.seqNum, pkt.msgType);
-    relayTriggerTime = millis() + random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
-    isPending = true;
-    
-    // Send to BLE
-    String msg = "⏳ QUEUED: Node " + String(pkt.srcID) + " Seq " + String(pkt.seqNum) + " (Wait " + String(relayTriggerTime - millis()) + "ms)";
-    Serial.println(msg);
-    notifyBLE(msg);
+
+    markSeenV1(frame);
+
+    // [BONUS] ACK frames get priority backoff so node stops retrying sooner
+    uint32_t delayMs = (frame.frame_type == sc::FRAME_ACK)
+        ? random(RELAY_MIN_DELAY / 3, RELAY_MIN_DELAY)
+        : random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
+
+    // [M0-1] Overflow-safe timer
+    pendingV1ScheduledAt = millis();
+    pendingV1DelayMs     = delayMs;
+    pendingV1QueuedAt    = millis();
+    pendingV1Valid       = true;
+
+    Serial.printf(">>> Queued V1 relay: origin=%s event=%lu frame=%s hop=%u wait=%lums\n",
+        pendingV1.origin_id,
+        (unsigned long)pendingV1.event_id,
+        sc::Protocol::frameTypeName(pendingV1.frame_type),
+        pendingV1.hop_count,
+        (unsigned long)delayMs);
 }
 
+// ---------------------------------------------------------------------------
+// update() — called every loop() tick
+// ---------------------------------------------------------------------------
 void RepeaterRouter::update() {
-    if (!isPending) return;
-    if (millis() < relayTriggerTime) return;
-    
-    LoRa.beginPacket();
-    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    LoRa.endPacket(); // Blocking send
-    LoRa.receive();   // Turn ears back on
-    
-    isPending = false;
-    packetsRelayed++;
-    
-    // Send to BLE
-    String msg = "📡 RELAYED: Seq " + String(pendingPacket.seqNum) + " (Hop " + String(pendingPacket.hopCount) + ")";
-    Serial.println(msg);
-    notifyBLE(msg);
-}
+    unsigned long now = millis();
 
-void RepeaterRouter::printStats() {
-    String stats = "\n=== REPEATER STATS ===\n";
-    stats += "Received: " + String(packetsReceived) + "\n";
-    stats += "Relayed:  " + String(packetsRelayed) + "\n";
-    stats += "Dropped:  " + String(packetsDropped) + "\n";
-    
-    if (packetsReceived > 0) {
-        float relayRate = (float)packetsRelayed / packetsReceived * 100.0;
-        stats += "Relay Rate: " + String(relayRate, 1) + "%\n";
-    }
-    
-    Serial.println(stats);
-    notifyBLE(stats);
-}
-
-bool RepeaterRouter::isDuplicate(const char* srcID, uint16_t seqNum, uint8_t msgType) {
-    for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
-        if (seenCache[i].seqNum == seqNum && 
-            seenCache[i].msgType == msgType &&
-            strcmp(seenCache[i].srcID, srcID) == 0) {
-            return true;
+    if (pendingV1Valid) {
+        // [TTL] Discard stale entries (e.g. queued during radio fault)
+        if ((now - pendingV1QueuedAt) > RELAY_TTL_MS) {
+            LOGD(">>> V1 relay TTL expired: origin=%s event=%lu\n",
+                pendingV1.origin_id, (unsigned long)pendingV1.event_id);
+            pendingV1Valid = false;
+            ttlExpired++;
+            packetsDropped++;
+        }
+        // [M0-1] Overflow-safe elapsed check
+        else if ((now - pendingV1ScheduledAt) >= pendingV1DelayMs) {
+            LOGD(">>> RELAYING V1 NOW...\n");
+            LoRa.beginPacket();
+            LoRa.write((uint8_t*)&pendingV1, sizeof(sc::SafeChainFrameV1));
+            LoRa.endPacket();
+            LoRa.receive();
+            pendingV1Valid = false;
+            packetsRelayed++;
+            Serial.printf(">>> V1 relayed: origin=%s event=%lu frame=%s hop=%u\n",
+                pendingV1.origin_id,
+                (unsigned long)pendingV1.event_id,
+                sc::Protocol::frameTypeName(pendingV1.frame_type),
+                pendingV1.hop_count);
         }
     }
-    return false;
 }
 
-void RepeaterRouter::markSeen(const char* srcID, uint16_t seqNum, uint8_t msgType) {
-    strncpy(seenCache[cacheIndex].srcID, srcID, 5);
-    seenCache[cacheIndex].seqNum = seqNum;
-    // 👇 FIX: Save the msgType
-    seenCache[cacheIndex].msgType = msgType;
-    cacheIndex = (cacheIndex + 1) % DUPLICATE_CACHE_SIZE;
+// ---------------------------------------------------------------------------
+// printStats
+// ---------------------------------------------------------------------------
+void RepeaterRouter::printStats() {
+    Serial.println("\n===== REPEATER STATS =====");
+    Serial.printf("Own ID             : %s\n",  ownNodeID);
+    Serial.printf("Packets Received   : %lu\n", (unsigned long)packetsReceived);
+    Serial.printf("Packets Relayed    : %lu\n", (unsigned long)packetsRelayed);
+    Serial.printf("Packets Dropped    : %lu\n", (unsigned long)packetsDropped);
+    Serial.printf("Duplicates Dropped : %lu\n", (unsigned long)duplicatesDropped);
+    Serial.printf("TTL Expired        : %lu\n", (unsigned long)ttlExpired);
+    Serial.println("==========================\n");
 }

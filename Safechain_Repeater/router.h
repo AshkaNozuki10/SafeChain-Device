@@ -3,58 +3,61 @@
 
 #include <Arduino.h>
 #include "config.h"
-#include "packet.h"
+#include "safechain_protocol.h"
+
+// [M4] Legacy SafeChainPacket path fully removed.
+// RepeaterRouter now handles V1 frames only.
 
 class RepeaterRouter {
 private:
-    struct CacheEntry {
-        char srcID[6];
-        uint16_t seqNum;
-        uint8_t msgType;  // 👇 FIX: Added msgType to the memory!
+    // [M0-5] ownNodeID sourced from NVS via init()
+    char ownNodeID[sc::DEVICE_ID_LEN];
+
+    // -------- V1 duplicate cache --------
+    struct V1CacheEntry {
+        char     originID[sc::DEVICE_ID_LEN];
+        uint32_t eventId;
+        uint8_t  frameType;
+        bool     used;
     };
-    CacheEntry seenCache[DUPLICATE_CACHE_SIZE];
-    uint8_t cacheIndex;
-    
-    // --- NEW: Time-Based Deduplication (Spam Protection) ---
-    struct EmergencyDedup {
-        char srcID[6];
-        uint8_t msgType;
-        unsigned long timestamp;
-    };
-    EmergencyDedup recentEmergencies[10];
-    uint8_t dedupIndex;
-    // -------------------------------------------------------
-    
-    // Pending relay state
-    SafeChainPacket pendingPacket;
-    bool isPending;
-    unsigned long relayTriggerTime;
-    
-    // Statistics
+    V1CacheEntry v1Seen[DUPLICATE_CACHE_SIZE];
+    uint8_t      v1SeenIndex;
+
+    // -------- Pending V1 relay (overflow-safe timers + TTL) --------
+    sc::SafeChainFrameV1 pendingV1;
+    bool                 pendingV1Valid;
+    unsigned long        pendingV1ScheduledAt; // [M0-1]
+    uint32_t             pendingV1DelayMs;
+    unsigned long        pendingV1QueuedAt;    // [TTL]
+
+    // [M3] PSK for prepareRelay (recomputes crc16 only — auth_tag stable)
+    uint8_t psk[sc::PSK_LEN];
+    size_t  pskLen;
+
+    // -------- Stats --------
     uint32_t packetsReceived;
     uint32_t packetsRelayed;
     uint32_t packetsDropped;
+    uint32_t duplicatesDropped;
+    uint32_t ttlExpired;
 
-    // 👇 FIX: Update these two lines to include uint8_t msgType
-    bool isDuplicate(const char* srcID, uint16_t seqNum, uint8_t msgType);
-    void markSeen(const char* srcID, uint16_t seqNum, uint8_t msgType);
-    
+    bool isDuplicateV1(const sc::SafeChainFrameV1 &frame);
+    void markSeenV1(const sc::SafeChainFrameV1 &frame);
+
 public:
     RepeaterRouter();
-    
-    void init();
-    bool shouldRelay(const SafeChainPacket &pkt);
-    void queueRelay(const SafeChainPacket &pkt);
+
+    // [M0-5] nodeId MUST be the NVS-sourced string
+    void init(const char* nodeId);
+
+    // [M3] Update PSK cache after setpsk command
+    void reloadPSK(const uint8_t* key, size_t len);
+
+    bool shouldRelayV1(const sc::SafeChainFrameV1 &frame);
+    void queueRelayV1(const sc::SafeChainFrameV1 &frame);
+
     void update();
     void printStats();
-    
-private:
-    bool isDuplicate(const char* srcID, uint16_t seqNum);
-    void markSeen(const char* srcID, uint16_t seqNum);
-    
-    // --- NEW: Time-Based Methods ---
-    bool isRecentEmergency(const SafeChainPacket &pkt);
-    void markRecentEmergency(const SafeChainPacket &pkt);
 };
 
 #endif

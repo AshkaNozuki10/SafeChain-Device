@@ -3,70 +3,113 @@
 
 #include <Arduino.h>
 
-// === DEVICE ROLES (Uncomment ONLY one) ===
+#define LOG_LEVEL_DEFAULT LOG_INFO
+
+// =======================================================
+// 1. MASTER HARDWARE SWITCH (Uncomment ONLY ONE)
+// =======================================================
+#define BOARD_ESP32_C3_SUPER_MINI
+// #define BOARD_ESP32_S3_SUPER_MINI
+
+// =======================================================
+// 2. DEVICE ROLES (Uncomment ONLY ONE)
+// =======================================================
 #define ROLE_NODE
 // #define ROLE_REPEATER
-// #define ROLE_GATEWAY+-
+// #define ROLE_GATEWAY
 
-// === HARDWARE PINS ===
-#define PIN_BUZZER      9
-#define PIN_GPS_RX      RX //20
-#define PIN_GPS_TX      TX //21
-#define PIN_RGB         48
+// =======================================================
+// 3. HARDWARE PINS
+// =======================================================
+#if defined(BOARD_ESP32_C3_SUPER_MINI)
+    #define PIN_BUZZER      10 // 2
+    #define PIN_GPS_RX      20
+    #define PIN_GPS_TX      21
+    #define PIN_RGB         9
+    #define PIN_BATTERY     0
+    #define PIN_BTN_FLOOD   3
+    #define PIN_BTN_FIRE    1 
+    #define PIN_BTN_CRIME   2 // 10
+    #define SCK_PIN         4
+    #define MISO_PIN        5
+    #define MOSI_PIN        6
+    #define SS_PIN          7
+    #define RST_PIN         8
+    #define DIO0_PIN        -1
+#elif defined(BOARD_ESP32_S3_SUPER_MINI)
+    #define PIN_BUZZER      9
+    #define PIN_GPS_RX      44
+    #define PIN_GPS_TX      43
+    #define PIN_RGB         48
+    #define PIN_BATTERY     3
+    #define PIN_BTN_FLOOD   1
+    #define PIN_BTN_FIRE    2
+    #define PIN_BTN_CRIME   4
+    #define SCK_PIN         7
+    #define MISO_PIN        5
+    #define MOSI_PIN        6
+    #define SS_PIN          10
+    #define RST_PIN         11
+    #define DIO0_PIN        -1
+#endif
 
-// 👇 ADDED BATTERY PIN HERE
-#define PIN_BATTERY     3  // Safe ADC1 Pin for voltage reading
-
-// Buttons (Used on Node, optional on Repeater for test)
-#define PIN_BTN_FLOOD   1
-#define PIN_BTN_FIRE    2
-#define PIN_BTN_CRIME   4
-
-// LoRa SPI
-#define SCK_PIN         7
-#define MISO_PIN        5
-#define MOSI_PIN        6
-#define SS_PIN          10
-#define RST_PIN         11
-#define DIO0_PIN        -1
-
-// === LORA SETTINGS ===
+// =======================================================
+// 4. LORA SETTINGS
+// =======================================================
 #define LORA_FREQ       433E6
 #define LORA_SF         11
 #define LORA_BW         125E3
 #define LORA_CR         8
 #define LORA_PREAMBLE   16
 #define LORA_SYNCWORD   0xF3
-#define LORA_TXPOWER    17  // Boosted to 20dBm for Repeater/Gateway
+#define LORA_TXPOWER    17
 
-// === PROTOCOL ===
+// =======================================================
+// 5. PROTOCOL TIMERS
+// =======================================================
 #define MAX_HOP         10
 
-// Adjust cache based on role
-#ifdef ROLE_REPEATER
-    #define DUPLICATE_CACHE_SIZE 60 // Remember more packets
-    #define RELAY_MIN_DELAY 200     // Faster relay
-    #define RELAY_MAX_DELAY 800
-#else
-    #define DUPLICATE_CACHE_SIZE 20
-    #define RELAY_MIN_DELAY 500
-    #define RELAY_MAX_DELAY 1500
-#endif
+// [M4] Node no longer relays packets — these settings remain for Repeater only
+// Repeater config.h retains its own DUPLICATE_CACHE_SIZE and RELAY delays
 
-#define ACK_TIMEOUT_MS  5000
-#define RETRY_INTERVAL_MS 8000
-#define MAX_RETRIES     3
+#define ACK_TIMEOUT_MS              5000
+#define RETRY_INTERVAL_MS           8000
+#define MAX_RETRIES                 3
+#define FAILED_RETRY_INTERVAL_MS    60000
 
-// === TIMING ===
-#define AUTO_MODE_INTERVAL  15000
-#define LED_UPDATE_INTERVAL 2000
-#define BLE_UPDATE_INTERVAL 3000  // ← ADD THIS LINE
-#define GPS_VALID_AGE_MS    5000  // ← ADD THIS LINE
+// =======================================================
+// 6. WATCHDOG & RADIO HEALTH  [M1]
+// =======================================================
+#define WDT_TIMEOUT_S                   10
+#define LORA_HEALTH_CHECK_INTERVAL_MS   30000
 
-// === MESSAGE TYPES ===
+// =======================================================
+// 7. UI TIMERS
+// =======================================================
+#define AUTO_MODE_INTERVAL      15000
+#define LED_UPDATE_INTERVAL     2000
+#define BLE_UPDATE_INTERVAL     3000
+#define GPS_VALID_AGE_MS        5000
+
+// =======================================================
+// 8. HEARTBEAT [M5]
+// =======================================================
+// How often to broadcast a FRAME_HEARTBEAT while idle
+#define HEARTBEAT_INTERVAL_MS       300000UL  // 5 minutes
+
+// Gateway marks a node OFFLINE after this much silence
+// Set to 3x interval plus a 3-minute margin for RF variance
+#define NODE_OFFLINE_THRESHOLD_MS   1080000UL // 18 minutes
+
+// How often the gateway checks for offline nodes
+#define NODE_OFFLINE_CHECK_MS       60000UL   // 1 minute
+
+// =======================================================
+// 9. MESSAGE ENUMS
+// =======================================================
 enum MsgType : uint8_t {
-    MSG_EMERGENCY = 0x01A,
-    MSG_HEARTBEAT = 0x02A,
+    MSG_EMERGENCY = 0x1A,
+    MSG_HEARTBEAT = 0x2A,
     MSG_ACK       = 0x0A,
     MSG_TEST      = 0xFF
 };
@@ -79,13 +122,19 @@ enum EmergencyType : uint8_t {
     EM_SAFE  = 0x04
 };
 
-// === DEFAULTS ===
+// =======================================================
+// 9. DEFAULT NODE IDs
+// =======================================================
 #ifdef ROLE_REPEATER
     #define DEFAULT_NODE_ID "REP01"
 #elif defined(ROLE_GATEWAY)
     #define DEFAULT_NODE_ID "GTW01"
 #else
-    #define DEFAULT_NODE_ID "S3" //FOB01
+    #if defined(BOARD_ESP32_S3_SUPER_MINI)
+        #define DEFAULT_NODE_ID "S3"
+    #else
+        #define DEFAULT_NODE_ID "FOB01"
+    #endif
 #endif
 
 #endif

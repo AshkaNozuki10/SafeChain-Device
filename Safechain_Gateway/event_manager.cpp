@@ -1,276 +1,423 @@
 #include "event_manager.h"
-#include "packet.h"
-#include "config.h"
-#include <Arduino.h>
-#include <LoRa.h>
-#include <cstring>
+#include <string.h>
+#include "debug_log.h"
 
-// === CONSTRUCTOR & INIT ===
-
-EventManager::EventManager() 
-    : eventIndex(0), nodeCount(0), cacheIndex(0), dedupIndex(0),
-      totalPackets(0), duplicatePackets(0), corruptedPackets(0) {
-    memset(events, 0, sizeof(events));
+// ============================================================
+// NodeRegistry implementation [M5]
+// ============================================================
+NodeRegistry::NodeRegistry() : count(0) {
     memset(nodes, 0, sizeof(nodes));
-    memset(seenCache, 0, sizeof(seenCache));
-    memset(recentEmergencies, 0, sizeof(recentEmergencies));
 }
 
+void NodeRegistry::init() {
+    count = 0;
+    memset(nodes, 0, sizeof(nodes));
+}
+
+void NodeRegistry::update(const char* originId, int16_t rssi,
+                           uint8_t battery, bool isHeartbeat) {
+    // Find existing record
+    for (uint8_t i = 0; i < MAX_NODES; i++) {
+        if (!nodes[i].used) continue;
+        if (strncmp(nodes[i].origin_id, originId, sc::DEVICE_ID_LEN) == 0) {
+            nodes[i].last_seen_ms = millis();
+            nodes[i].last_rssi    = rssi;
+            nodes[i].last_battery = battery;
+            nodes[i].frames_received++;
+            if (isHeartbeat) nodes[i].heartbeats_received++;
+
+            if (nodes[i].status != NODE_ONLINE) {
+                Serial.printf(">>> NODE ONLINE: %s (was %s)\n",
+                    originId,
+                    nodes[i].status == NODE_OFFLINE ? "OFFLINE" : "UNKNOWN");
+                nodes[i].status = NODE_ONLINE;
+            }
+            return;
+        }
+    }
+
+    // New node — register it
+    for (uint8_t i = 0; i < MAX_NODES; i++) {
+        if (nodes[i].used) continue;
+        nodes[i].used             = true;
+        strncpy(nodes[i].origin_id, originId, sc::DEVICE_ID_LEN - 1);
+        nodes[i].origin_id[sc::DEVICE_ID_LEN - 1] = '\0';
+        nodes[i].last_seen_ms     = millis();
+        nodes[i].last_rssi        = rssi;
+        nodes[i].last_battery     = battery;
+        nodes[i].status           = NODE_ONLINE;
+        nodes[i].frames_received  = 1;
+        nodes[i].heartbeats_received = isHeartbeat ? 1 : 0;
+        count++;
+        Serial.printf(">>> NODE REGISTERED: %s RSSI=%d batt=%u%%\n",
+            originId, rssi, battery);
+        return;
+    }
+
+    Serial.println(">>> WARNING: NodeRegistry full — cannot register new node");
+}
+
+void NodeRegistry::checkOffline() {
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < MAX_NODES; i++) {
+        if (!nodes[i].used) continue;
+        if (nodes[i].status == NODE_OFFLINE) continue;
+
+        // [M0-1] Overflow-safe elapsed check
+        if ((now - nodes[i].last_seen_ms) >= NODE_OFFLINE_THRESHOLD_MS) {
+            nodes[i].status = NODE_OFFLINE;
+            Serial.printf(">>> NODE OFFLINE: %s — silent for >%lus | last batt=%u%% RSSI=%d\n",
+                nodes[i].origin_id,
+                (unsigned long)(NODE_OFFLINE_THRESHOLD_MS / 1000),
+                nodes[i].last_battery,
+                nodes[i].last_rssi);
+        }
+    }
+}
+
+void NodeRegistry::printAll() const {
+    Serial.println("\n===== NODE REGISTRY =====");
+    if (count == 0) {
+        Serial.println("  (no nodes seen yet)");
+    }
+    for (uint8_t i = 0; i < MAX_NODES; i++) {
+        if (!nodes[i].used) continue;
+        unsigned long age_s = (millis() - nodes[i].last_seen_ms) / 1000;
+        const char* statusStr =
+            nodes[i].status == NODE_ONLINE  ? "ONLINE"  :
+            nodes[i].status == NODE_OFFLINE ? "OFFLINE" : "UNKNOWN";
+        Serial.printf("  %-6s  %-7s  batt=%3u%%  RSSI=%4d  age=%lus  frames=%lu  hb=%lu\n",
+            nodes[i].origin_id, statusStr,
+            nodes[i].last_battery, nodes[i].last_rssi,
+            age_s,
+            (unsigned long)nodes[i].frames_received,
+            (unsigned long)nodes[i].heartbeats_received);
+    }
+    Serial.println("=========================\n");
+}
+
+const NodeRecord* NodeRegistry::getRecord(uint8_t idx) const {
+    if (idx >= MAX_NODES || !nodes[idx].used) return nullptr;
+    return &nodes[idx];
+}
+
+// ============================================================
+// EventManager implementation
+// ============================================================
+EventManager::EventManager()
+    : totalPackets(0), duplicatePackets(0), corruptedPackets(0),
+      ackSent(0), journaledEvents(0), replayedEvents(0),
+      heartbeatsReceived(0),
+      pendingAckValid(false), ackScheduledAt(0), ackDelayMs(0),
+      pskLen(sc::PSK_LEN),
+      lastOfflineCheckMs(0) {
+    memset(&pendingAckFrame, 0, sizeof(pendingAckFrame));
+    memcpy(psk, sc::PSK_DEFAULT, sc::PSK_LEN);
+}
+
+// ---------------------------------------------------------------------------
+// init() — loads NVS journal, replays uncommitted, inits node registry
+// ---------------------------------------------------------------------------
 void EventManager::init() {
-    Serial.println("✅ Event Manager Ready");
+    nodeReg.init(); // [M5]
+    uint16_t uncommitted = journal.init();
+    if (uncommitted > 0) {
+        Serial.printf(">>> EventManager: %u uncommitted events — replaying\n", uncommitted);
+        replayUncommitted();
+    }
+    lastOfflineCheckMs = millis();
 }
 
-// === SEQUENCE DEDUPLICATION (RETRIES) ===
+// ---------------------------------------------------------------------------
+// reloadPSK [M3]
+// ---------------------------------------------------------------------------
+void EventManager::reloadPSK(const uint8_t* key, size_t len) {
+    if (len > sc::PSK_LEN) len = sc::PSK_LEN;
+    memcpy(psk, key, len);
+    pskLen = len;
+    Serial.println(">>> Gateway PSK updated");
+}
 
-bool EventManager::isDuplicate(const char* srcID, uint16_t seqNum) {
-    for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
-        if (seenCache[i].seqNum == seqNum && strcmp(seenCache[i].srcID, srcID) == 0) {
-            return true;
+// ---------------------------------------------------------------------------
+// replayUncommitted [M2]
+// ---------------------------------------------------------------------------
+void EventManager::replayUncommitted() {
+    uint16_t n = journal.replayCount();
+    if (n == 0) return;
+
+    Serial.println(">>> ===== JOURNAL REPLAY START =====");
+
+    for (uint16_t i = 0; i < n; i++) {
+        const GatewayJournalRecord* rec = journal.getReplayRecord(i);
+        if (!rec) continue;
+
+        float lat = rec->lat_e7 / 10000000.0f;
+        float lon = rec->lon_e7 / 10000000.0f;
+
+        Serial.printf("REPLAY_CSV_V1,%s,%lu,%s,%.6f,%.6f,%u,%d,%u,%u\n",
+            rec->origin_id, (unsigned long)rec->event_id,
+            getEventTypeNameV1(rec->event_type), lat, lon,
+            rec->battery_pct, rec->rssi_dbm, rec->hop_count, rec->attempt);
+
+        printEventAlertFromRecord(*rec);
+
+        if (rec->status == GW_EVT_RECEIVED)
+            journal.markHostQueued(rec->origin_id, rec->event_id);
+
+        replayedEvents++;
+
+        if (!pendingAckValid) {
+            sc::SafeChainFrameV1 syn{};
+            syn.protocol_version = sc::PROTOCOL_VERSION;
+            syn.frame_type       = sc::FRAME_EVENT;
+            syn.event_type       = rec->event_type;
+            syn.flags            = sc::FLAG_REQUIRE_ACK;
+            strncpy(syn.origin_id, rec->origin_id, sc::DEVICE_ID_LEN - 1);
+            syn.event_id  = rec->event_id;
+            syn.max_hops  = sc::MAX_HOPS_DEFAULT;
+            sc::Protocol::finalizeFrame(syn, psk, pskLen);
+
+            pendingAckFrame = syn;
+            ackScheduledAt  = millis() + 500 + (i * 300);
+            ackDelayMs      = 0;
+            pendingAckValid = true;
         }
     }
-    return false;
+
+    Serial.printf(">>> ===== JOURNAL REPLAY END (%u events) =====\n", n);
 }
 
-void EventManager::markSeen(const char* srcID, uint16_t seqNum) {
-    strncpy(seenCache[cacheIndex].srcID, srcID, 5);
-    seenCache[cacheIndex].srcID[5] = '\0';
-    seenCache[cacheIndex].seqNum = seqNum;
-    cacheIndex = (cacheIndex + 1) % DUPLICATE_CACHE_SIZE;
-}
+// ---------------------------------------------------------------------------
+// update() — ACK scheduler + offline check [M0-3, M5]
+// ---------------------------------------------------------------------------
+void EventManager::update() {
+    // [M0-3] Fire pending ACK
+    if (pendingAckValid && (millis() - ackScheduledAt) >= ackDelayMs) {
+        pendingAckValid = false;
 
-// === TIME-BASED DEDUPLICATION (SPAM PROTECTION) ===
+        sc::SafeChainFrameV1 ackFrame;
+        sc::Protocol::buildAckFrame(
+            ackFrame, DEFAULT_NODE_ID,
+            pendingAckFrame.origin_id, pendingAckFrame.event_id,
+            static_cast<sc::EventType>(pendingAckFrame.event_type),
+            psk, pskLen,
+            pendingAckFrame.max_hops);
 
-bool EventManager::isRecentDuplicate(const SafeChainPacket &pkt) {
-    if (pkt.msgType < EM_FIRE || pkt.msgType > EM_CRIME) {
-        return false;
+        Serial.printf(">>> SENDING V1 ACK TO: %s (EventID: %lu)\n",
+            pendingAckFrame.origin_id, (unsigned long)pendingAckFrame.event_id);
+
+        LoRa.beginPacket();
+        LoRa.write((const uint8_t*)&ackFrame, sizeof(sc::SafeChainFrameV1));
+        LoRa.endPacket();
+        LoRa.receive();
+        ackSent++;
     }
-    
-    // We increased this to 40 in the header to support 30 nodes
-    for (int i = 0; i < 40; i++) {
-        if (strcmp(recentEmergencies[i].srcID, pkt.srcID) == 0 &&
-            recentEmergencies[i].msgType == pkt.msgType &&
-            (millis() - recentEmergencies[i].timestamp) < DEDUP_WINDOW_MS) {
-            
-            Serial.printf(">>> DEDUP: Same emergency from %s within 30s\n", pkt.srcID);
-            return true;
-        }
+
+    // [M5] Periodic offline check
+    if ((millis() - lastOfflineCheckMs) >= NODE_OFFLINE_CHECK_MS) {
+        lastOfflineCheckMs = millis();
+        nodeReg.checkOffline();
     }
-    return false;
 }
 
-void EventManager::markRecentEmergency(const SafeChainPacket &pkt) {
-    strncpy(recentEmergencies[dedupIndex].srcID, pkt.srcID, 5);
-    recentEmergencies[dedupIndex].srcID[5] = '\0';
-    recentEmergencies[dedupIndex].msgType = pkt.msgType;
-    recentEmergencies[dedupIndex].timestamp = millis();
-    dedupIndex = (dedupIndex + 1) % 40; 
+// ---------------------------------------------------------------------------
+// scheduleAckV1 [M0-3]
+// ---------------------------------------------------------------------------
+void EventManager::scheduleAckV1(const sc::SafeChainFrameV1 &frame) {
+    pendingAckFrame = frame;
+    ackScheduledAt  = millis();
+    ackDelayMs      = random(100, 300);
+    pendingAckValid = true;
 }
 
-// === CORE PACKET PROCESSING ===
+// ---------------------------------------------------------------------------
+// [M5] handleHeartbeat — updates node registry, no journal entry, no ACK
+// ---------------------------------------------------------------------------
+void EventManager::handleHeartbeat(const sc::SafeChainFrameV1 &frame) {
+    heartbeatsReceived++;
 
-bool EventManager::processPacket(SafeChainPacket &pkt) {
+    nodeReg.update(frame.origin_id, frame.last_rssi_dbm,
+                   frame.battery_pct, true);
+
+    float lat = frame.lat_e7 / 10000000.0f;
+    float lon = frame.lon_e7 / 10000000.0f;
+
+    Serial.printf("[HEARTBEAT] node=%-6s  batt=%3u%%  RSSI=%4d  GPS=%s",
+        frame.origin_id,
+        frame.battery_pct,
+        frame.last_rssi_dbm,
+        (frame.flags & sc::FLAG_GPS_VALID) ? "valid" : "none");
+
+    if (frame.flags & sc::FLAG_GPS_VALID)
+        Serial.printf("  loc=%.5f,%.5f", lat, lon);
+
+    if (frame.flags & sc::FLAG_LOW_BATTERY)
+        Serial.print("  [LOW BATT]");
+
+    Serial.println();
+
+    // CSV line for host software
+    Serial.printf("HB_V1,%s,%.6f,%.6f,%u,%d\n",
+        frame.origin_id, lat, lon,
+        frame.battery_pct, frame.last_rssi_dbm);
+}
+
+// ---------------------------------------------------------------------------
+// processFrameV1 — handles EVENT, HEARTBEAT, ignores ACK
+// ---------------------------------------------------------------------------
+bool EventManager::processFrameV1(sc::SafeChainFrameV1 &frame) {
     totalPackets++;
-    
-    // 1. Check sequence-based duplicate (retries)
-    if (isDuplicate(pkt.srcID, pkt.seqNum)) {
+
+    // [M5] Update node registry on every valid frame
+    nodeReg.update(frame.origin_id, frame.last_rssi_dbm,
+                   frame.battery_pct,
+                   frame.frame_type == sc::FRAME_HEARTBEAT);
+
+    if (frame.frame_type == sc::FRAME_ACK) {
+        LOGD(">>> V1 ACK at gateway - ignored\n");
+        return false;
+    }
+
+    // [M5] Heartbeat path — no journal, no ACK
+    if (frame.frame_type == sc::FRAME_HEARTBEAT) {
+        handleHeartbeat(frame);
+        return true;
+    }
+
+    if (frame.frame_type != sc::FRAME_EVENT) {
+        Serial.printf(">>> Unsupported V1 frame type: %u\n", frame.frame_type);
+        return false;
+    }
+
+    // EVENT_TEST — validate auth but skip journaling
+    if (frame.event_type == sc::EVENT_TEST) {
+        Serial.printf("[TEST PKT] node=%s RSSI=%d\n",
+            frame.origin_id, frame.last_rssi_dbm);
+        return true;
+    }
+
+    // Emergency event path
+    bool isNew = journal.appendIfNew(frame);
+
+    if (!isNew) {
         duplicatePackets++;
-        Serial.println(">>> Duplicate packet - Logged but not displayed");
+        Serial.printf(">>> DUPLICATE V1: origin=%s event=%lu\n",
+            frame.origin_id, (unsigned long)frame.event_id);
+        if (frame.flags & sc::FLAG_REQUIRE_ACK)
+            scheduleAckV1(frame);
         return false;
     }
-    
-    // 2. Check time-window duplicate (multiple frantic presses)
-    if (isRecentDuplicate(pkt)) {
-        Serial.println(">>> Suppressed: Same emergency within 30s");
-        logCSV(pkt);  // Still log for analysis
-        
-        // CRITICAL FIX: The Gateway must still ACK the Node so it stops retrying!
-        if (pkt.msgType >= EM_FIRE && pkt.msgType <= EM_CRIME) {
-            sendACK(pkt);
-        }
-        return false;
-    }
-    
-    // Track both types of deduplication
-    markSeen(pkt.srcID, pkt.seqNum);
-    if (pkt.msgType >= EM_FIRE && pkt.msgType <= EM_CRIME) {
-        markRecentEmergency(pkt);
-    }
-    
-    // Update node statistics
-    updateNodeStats(pkt);
-    
-    // Display alert
-    displayAlert(pkt);
-    
-    // Log to CSV
-    logCSV(pkt);
-    
-    // Store event
-    if (pkt.msgType != MSG_ACK && pkt.msgType != MSG_TEST) {
-        storeEvent(pkt);
-    }
-    
-    // Send ACK for emergencies (FIRE, FLOOD, CRIME)
-    if (pkt.msgType >= EM_FIRE && pkt.msgType <= EM_CRIME) {
-        sendACK(pkt);
-    }
-    
+
+    journaledEvents++;
+
+    float lat = frame.lat_e7 / 10000000.0f;
+    float lon = frame.lon_e7 / 10000000.0f;
+
+    printEventAlert(frame);
+
+    Serial.printf("CSV_V1,%s,%lu,%s,%.6f,%.6f,%u,%d,%u,%u\n",
+        frame.origin_id, (unsigned long)frame.event_id,
+        getEventTypeNameV1(frame.event_type), lat, lon,
+        frame.battery_pct, frame.last_rssi_dbm,
+        frame.hop_count, frame.attempt);
+
+    journal.markHostQueued(frame.origin_id, frame.event_id);
+
+    if (frame.flags & sc::FLAG_REQUIRE_ACK)
+        scheduleAckV1(frame);
+
     return true;
 }
 
-// === RESPONSE ROUTINES ===
-
-void EventManager::sendACK(const SafeChainPacket &pkt) {
-    SafeChainPacket ackPkt;
-    PacketBuilder::buildACK(ackPkt, pkt.srcID, pkt.seqNum);
-    
-    // Random backoff to prevent Gateway-Repeater collisions
-    delay(random(100, 300));
-    
-    Serial.printf(">>> SENDING ACK TO: %s (Seq: %u)\n", pkt.srcID, pkt.seqNum);
-    
-    LoRa.beginPacket();
-    LoRa.write((uint8_t*)&ackPkt, sizeof(SafeChainPacket));
-    LoRa.endPacket(); // Blocking send
-    
-    LoRa.receive(); // Turn ears back on
+// ---------------------------------------------------------------------------
+// hostCommit [M2]
+// ---------------------------------------------------------------------------
+bool EventManager::hostCommit(const char* originId, uint32_t eventId) {
+    bool ok = journal.markHostCommitted(originId, eventId);
+    if (ok)
+        Serial.printf(">>> HOST COMMIT: origin=%s event=%lu — NVS cleared\n",
+            originId, (unsigned long)eventId);
+    else
+        Serial.printf(">>> HOST COMMIT FAILED: origin=%s event=%lu not found\n",
+            originId, (unsigned long)eventId);
+    return ok;
 }
 
-// === DISPLAY & LOGGING ===
-
-void EventManager::displayAlert(const SafeChainPacket &pkt) {
-    Serial.println("\n🚨 ================= EMERGENCY ALERT ================= 🚨");
-    
-    // 1. Print the exact trigger words the Python script is looking for
-    if (pkt.msgType == EM_FIRE) {
-        Serial.println("   ** FIRE ALARM **");
-    } else if (pkt.msgType == EM_FLOOD) {
-        Serial.println("   ** FLOOD ALERT **");
-    } else if (pkt.msgType == EM_CRIME) {
-        Serial.println("   ** CRIME / SOS **");
-    } else if (pkt.msgType == EM_SAFE) {
-        Serial.println("   ** USER MARKED SAFE **");
-    } else {
-        Serial.println("   ** UNKNOWN **");
-    }
-
-    // 2. Format Node ID and Location exactly as Python expects (with the spaces before the colon)
-    Serial.printf("   NODE ID : %s\n", pkt.srcID);
-    Serial.printf("   LOCATION : %.6f, %.6f\n", pkt.latitude, pkt.longitude);
-    
-    // 3. Extra info (Python script ignores these, but good for local terminal viewing)
-    Serial.printf("   BATTERY:  %u%%\n", pkt.battery);
-    Serial.printf("   NETWORK:  RSSI %d dBm | Hops: %u\n", pkt.rssi, pkt.hopCount);
-    Serial.println("=========================================================\n");
-}
-
-void EventManager::logCSV(const SafeChainPacket &pkt) {
-    // Format: CSV,Timestamp,NodeID,MsgType,SeqNum,Lat,Lon,Hops,Battery,RSSI
-    Serial.printf("CSV,%lu,%s,%02X,%u,%.6f,%.6f,%u,%u,%d\n", 
-        millis(), pkt.srcID, pkt.msgType, pkt.seqNum, 
-        pkt.latitude, pkt.longitude, pkt.hopCount, pkt.battery, pkt.rssi);
-}
-
-void EventManager::storeEvent(const SafeChainPacket &pkt) {
-    EmergencyEvent &evt = events[eventIndex];
-    evt.eventID = millis(); // Simple unique ID
-    strncpy(evt.srcID, pkt.srcID, 5);
-    evt.srcID[5] = '\0';
-    evt.msgType = pkt.msgType;
-    evt.seqNum = pkt.seqNum;
-    evt.latitude = pkt.latitude;
-    evt.longitude = pkt.longitude;
-    evt.hopCount = pkt.hopCount;
-    evt.battery = pkt.battery;
-    evt.rssi = pkt.rssi;
-    evt.timestamp = millis();
-    evt.active = true;
-    
-    eventIndex = (eventIndex + 1) % MAX_EVENTS;
-}
-
-// === NODE TRACKING & STATS ===
-
-NodeStats* EventManager::findNode(const char* nodeID) {
-    for (int i = 0; i < nodeCount; i++) {
-        if (strcmp(nodes[i].nodeID, nodeID) == 0) return &nodes[i];
-    }
-    // Note: We changed this to 40 in the header to support 30 nodes safely
-    if (nodeCount < 40) { 
-        strncpy(nodes[nodeCount].nodeID, nodeID, 5);
-        nodes[nodeCount].nodeID[5] = '\0';
-        nodes[nodeCount].packetsReceived = 0;
-        nodes[nodeCount].packetsMissed = 0;
-        nodes[nodeCount].avgRSSI = 0;
-        nodes[nodeCount].avgHops = 0;
-        nodeCount++;
-        return &nodes[nodeCount - 1];
-    }
-    return nullptr;
-}
-
-void EventManager::updateNodeStats(const SafeChainPacket &pkt) {
-    NodeStats* node = findNode(pkt.srcID);
-    if (!node) return;
-    
-    // Check for missed packets based on sequence numbers
-    if (node->packetsReceived > 0 && pkt.seqNum > node->lastSeq + 1) {
-        node->packetsMissed += (pkt.seqNum - node->lastSeq - 1);
-    }
-    
-    node->packetsReceived++;
-    node->lastSeq = pkt.seqNum;
-    node->lastSeen = millis();
-    
-    // Moving average for RSSI and Hops
-    if (node->packetsReceived == 1) {
-        node->avgRSSI = pkt.rssi;
-        node->avgHops = pkt.hopCount;
-    } else {
-        node->avgRSSI = (node->avgRSSI * 0.8) + (pkt.rssi * 0.2);
-        node->avgHops = (node->avgHops * 0.8) + (pkt.hopCount * 0.2);
+// ---------------------------------------------------------------------------
+// Printers
+// ---------------------------------------------------------------------------
+const char* EventManager::getEventTypeNameV1(uint8_t eventType) {
+    switch (eventType) {
+        case sc::EVENT_FIRE:  return "FIRE";
+        case sc::EVENT_FLOOD: return "FLOOD";
+        case sc::EVENT_CRIME: return "CRIME";
+        case sc::EVENT_SAFE:  return "SAFE";
+        case sc::EVENT_TEST:  return "TEST";
+        default:              return "UNKNOWN";
     }
 }
 
-// === HELPERS ===
+void EventManager::printEventAlert(const sc::SafeChainFrameV1 &frame) {
+    float lat = frame.lat_e7 / 10000000.0f;
+    float lon = frame.lon_e7 / 10000000.0f;
+    Serial.println("\n EMERGENCY ALERT");
+    switch (frame.event_type) {
+        case sc::EVENT_FIRE:  Serial.println("   ** FIRE ALARM **");      break;
+        case sc::EVENT_FLOOD: Serial.println("   ** FLOOD ALERT **");     break;
+        case sc::EVENT_CRIME: Serial.println("   ** CRIME / SOS **");     break;
+        case sc::EVENT_SAFE:  Serial.println("   ** USER MARKED SAFE **");break;
+        default:              Serial.println("   ** UNKNOWN EVENT **");   break;
+    }
+    Serial.printf("   NODE ID  : %s\n",  frame.origin_id);
+    Serial.printf("   EVENT ID : %lu\n", (unsigned long)frame.event_id);
+    Serial.printf("   LOCATION : %.6f, %.6f\n", lat, lon);
+    Serial.printf("   BATTERY  : %u%%\n",  frame.battery_pct);
+    Serial.printf("   NETWORK  : RSSI %d dBm | Hops: %u\n",
+        frame.last_rssi_dbm, frame.hop_count);
+    Serial.printf("   TYPE     : %s\n",   getEventTypeNameV1(frame.event_type));
+    Serial.printf("   ATTEMPT  : %u\n",   frame.attempt);
+    Serial.printf("   GPS VALID: %s\n",   (frame.flags & sc::FLAG_GPS_VALID) ? "yes" : "no");
+    Serial.printf("   LOW BATT : %s\n",   (frame.flags & sc::FLAG_LOW_BATTERY) ? "yes" : "no");
+    Serial.println("  ===================================================");
+}
 
-const char* EventManager::getTypeName(uint8_t type) {
-    if (type >= EM_FIRE && type <= EM_CRIME) {
-        switch(type) {
-            case EM_FIRE: return "FIRE";
-            case EM_FLOOD: return "FLOOD";
-            case EM_CRIME: return "CRIME";
-            case EM_SAFE: return "SAFE";
-            default: return "EMERGENCY";
-        }
+void EventManager::printEventAlertFromRecord(const GatewayJournalRecord &rec) {
+    float lat = rec.lat_e7 / 10000000.0f;
+    float lon = rec.lon_e7 / 10000000.0f;
+    Serial.println("\n [REPLAY] EMERGENCY ALERT");
+    switch (rec.event_type) {
+        case sc::EVENT_FIRE:  Serial.println("   ** FIRE ALARM **");      break;
+        case sc::EVENT_FLOOD: Serial.println("   ** FLOOD ALERT **");     break;
+        case sc::EVENT_CRIME: Serial.println("   ** CRIME / SOS **");     break;
+        case sc::EVENT_SAFE:  Serial.println("   ** USER MARKED SAFE **");break;
+        default:              Serial.println("   ** UNKNOWN EVENT **");   break;
     }
-    switch(type) {
-        case MSG_ACK: return "ACK";
-        case MSG_HEARTBEAT: return "HEARTBEAT";
-        case MSG_TEST: return "TEST";
-        default: return "UNKNOWN";
-    }
+    Serial.printf("   NODE ID  : %s\n",  rec.origin_id);
+    Serial.printf("   EVENT ID : %lu\n", (unsigned long)rec.event_id);
+    Serial.printf("   LOCATION : %.6f, %.6f\n", lat, lon);
+    Serial.printf("   BATTERY  : %u%%\n", rec.battery_pct);
+    Serial.printf("   NETWORK  : RSSI %d dBm | Hops: %u\n",
+        rec.rssi_dbm, rec.hop_count);
+    Serial.printf("   TYPE     : %s\n",  getEventTypeNameV1(rec.event_type));
+    Serial.printf("   ATTEMPT  : %u\n",  rec.attempt);
+    Serial.println("  ===================================================");
+}
+
+void EventManager::printNodes() const {
+    nodeReg.printAll();
 }
 
 void EventManager::printStats() {
-    Serial.println("\n=== GATEWAY STATISTICS ===");
-    Serial.printf("Total Packets:      %lu\n", totalPackets);
-    Serial.printf("Duplicate Packets:  %lu\n", duplicatePackets);
-    Serial.printf("Corrupted Packets:  %lu\n", corruptedPackets);
-    Serial.printf("Active Nodes:       %u\n", nodeCount);
-    Serial.println("==========================\n");
-}
-
-void EventManager::printPDR() {
-    Serial.println("\n=== PACKET DELIVERY RATIO (PDR) ===");
-    for (int i = 0; i < nodeCount; i++) {
-        NodeStats &node = nodes[i];
-        uint16_t total = node.packetsReceived + node.packetsMissed;
-        float pdr = (total > 0) ? (float)node.packetsReceived / total * 100.0 : 0;
-        
-        Serial.printf("Node %s:\n", node.nodeID);
-        Serial.printf("  Received: %u | Missed: %u | PDR: %.1f%%\n", node.packetsReceived, node.packetsMissed, pdr);
-        Serial.printf("  Avg RSSI: %d dBm | Avg Hops: %.1f\n", node.avgRSSI, node.avgHops);
-    }
-    Serial.println("===================================\n");
+    Serial.println("\n===== GATEWAY STATS =====");
+    Serial.printf("Total Packets      : %lu\n", (unsigned long)totalPackets);
+    Serial.printf("Duplicate Packets  : %lu\n", (unsigned long)duplicatePackets);
+    Serial.printf("Corrupted Packets  : %lu\n", (unsigned long)corruptedPackets);
+    Serial.printf("ACKs Sent          : %lu\n", (unsigned long)ackSent);
+    Serial.printf("Journaled Events   : %lu\n", (unsigned long)journaledEvents);
+    Serial.printf("Replayed Events    : %lu\n", (unsigned long)replayedEvents);
+    Serial.printf("Heartbeats Rcvd    : %lu\n", (unsigned long)heartbeatsReceived);
+    Serial.printf("Journal Size       : %u\n",  journal.size());
+    Serial.printf("Nodes Tracked      : %u\n",  nodeReg.size());
+    Serial.printf("Pending ACK        : %s\n",  pendingAckValid ? "yes" : "no");
+    Serial.println("=========================\n");
 }

@@ -6,26 +6,28 @@
 // === DEVICE ROLES (Uncomment ONLY one) ===
 #define ROLE_NODE
 // #define ROLE_REPEATER
-// #define ROLE_GATEWAY
+// #define ROLE_GATEWAY+-
 
 // === HARDWARE PINS ===
-#define PIN_BUZZER      2
-#define PIN_GPS_RX      20
-#define PIN_GPS_TX      21
-#define PIN_RGB         9 // change back to pin 0 for esp32 s3
-// Buttons (Used on Node, optional on Repeater for test)
-#define PIN_BTN_FLOOD   3
-#define PIN_BTN_FIRE    1
-#define PIN_BTN_CRIME   10
+#define PIN_BUZZER      9
+#define PIN_GPS_RX      RX //20
+#define PIN_GPS_TX      TX //21
+#define PIN_RGB         48
 
-#define PIN_BATTERY     0   // Safe ADC1 Pin for voltage reading
+// 👇 ADDED BATTERY PIN HERE
+#define PIN_BATTERY     3  // Safe ADC1 Pin for voltage reading
+
+// Buttons (Used on Node, optional on Repeater for test)
+#define PIN_BTN_FLOOD   1
+#define PIN_BTN_FIRE    2
+#define PIN_BTN_CRIME   4
 
 // LoRa SPI
-#define SCK_PIN         4
+#define SCK_PIN         7
 #define MISO_PIN        5
 #define MOSI_PIN        6
-#define SS_PIN          7
-#define RST_PIN         8
+#define SS_PIN          10
+#define RST_PIN         11
 #define DIO0_PIN        -1
 
 // === LORA SETTINGS ===
@@ -63,8 +65,8 @@
 
 // === MESSAGE TYPES ===
 enum MsgType : uint8_t {
-    MSG_EMERGENCY = 0x01,
-    MSG_HEARTBEAT = 0x02,
+    MSG_EMERGENCY = 0x01A,
+    MSG_HEARTBEAT = 0x02A,
     MSG_ACK       = 0x0A,
     MSG_TEST      = 0xFF
 };
@@ -83,7 +85,7 @@ enum EmergencyType : uint8_t {
 #elif defined(ROLE_GATEWAY)
     #define DEFAULT_NODE_ID "GTW01"
 #else
-    #define DEFAULT_NODE_ID "FOB01"
+    #define DEFAULT_NODE_ID "S3" //FOB01
 #endif
 
 #endif

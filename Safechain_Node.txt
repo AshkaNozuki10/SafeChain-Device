@@ -3,137 +3,233 @@
 FILE: Safechain_Node.ino
 ==================================================
 
-//node code
-
+// ============================================================
+// Safechain_Node.ino  —  M0 + M1 + M2(NVS journal) + M3(auth)
+// ============================================================
 #include <SPI.h>
 #include <LoRa.h>
 #include <OneButton.h>
-#include <driver/rtc_io.h> // 👇 ADD THIS LINE
+#include <esp_task_wdt.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
 
 #include "config.h"
-#include "packet.h"
-#include "router.h"
+
 #include "emergency.h"
 #include "ble_terminal.h"
 #include "gps_manager.h"
 #include "led_manager.h"
 #include "storage.h"
+#include "safechain_protocol.h"
+#include "debug_log.h"
 
-// === GLOBAL OBJECTS ===
-Storage storage;
-Router router;
+// ============================================================
+// GLOBAL OBJECTS
+// ============================================================
+Storage          storage;
 EmergencyManager emergency;
-BLETerminal ble;
-GPSManager gpsManager;
-LEDManager led;
+BLETerminal      ble;
+GPSManager       gpsManager;
+LEDManager       led;
 
-// Buttons
 OneButton btnFlood(PIN_BTN_FLOOD, true);
-OneButton btnFire(PIN_BTN_FIRE, true);
+OneButton btnFire (PIN_BTN_FIRE,  true);
 OneButton btnCrime(PIN_BTN_CRIME, true);
 
-// State
-String nodeID;
-bool autoMode = false;
-unsigned long lastAutoTime = 0;
-unsigned long lastLedUpdate = 0;
-unsigned long lastBleUpdate = 0;
-
+String        nodeID;
+bool          autoMode            = false;
+unsigned long lastAutoTime        = 0;
+unsigned long lastLedUpdate       = 0;
+unsigned long lastBleUpdate       = 0;
 unsigned long lastBatteryWarnTime = 0;
-const unsigned long BATTERY_WARN_INTERVAL = 10000; // 10 seconds
+unsigned long lastActivityTime    = 0;
+unsigned long lastHeartbeatTime   = 0; // [M5]
+uint32_t      heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS; // [M6] runtime-adjustable
 
-// 👇 ADD THESE TWO LINES RIGHT HERE!
-bool needsGPSRefine = false;
-EmergencyType activeEmergency = EM_NONE;
+const unsigned long BATTERY_WARN_INTERVAL = 10000;
+const unsigned long SLEEP_TIMEOUT         = 180000;
 
-// --- POWER MANAGEMENT ---
-unsigned long lastActivityTime = 0;
-const unsigned long SLEEP_TIMEOUT = 180000; // 3 Minutes (180,000 ms)
-RTC_DATA_ATTR int bootCount = 0; // Remembers how many times it woke up from sleep
+RTC_DATA_ATTR int bootCount       = 0;
+RTC_DATA_ATTR int loraReinitCount = 0;
 
-// === FORWARD DECLARATIONS ===
-void handleCommand(String cmd);
-void sendTestPacket();
-void triggerFlood();
-void triggerFire();
-void triggerCrime();
-void triggerSafe();
-void onGPSInject(float lat, float lon);
-void onBLECommand(String cmd);
-void flashRGB(int r, int g, int b, int times);
-uint8_t getBatteryLevel();
+unsigned long lastLoraHealthCheck = 0;
+uint32_t      loraFaultCount      = 0;
 
-// === SETUP ===
-void setup() {
-     Serial.begin(115200);
+// [M3] Node PSK cache — loaded from storage on boot
+uint8_t nodePSK[sc::PSK_LEN];
+
+// ============================================================
+// [M0-2] NON-BLOCKING SIREN
+// ============================================================
+struct SirenStep { uint16_t freq; uint16_t dur_ms; };
+
+static const SirenStep SIREN_FLOOD[] = {{2000,300},{0,300},{2000,300},{0,300},{2000,300},{0,350}};
+static const SirenStep SIREN_FIRE[]  = {{1000,280},{2500,280},{1000,280},{2500,280},{1000,280},{2500,300}};
+static const SirenStep SIREN_CRIME[] = {{3500,60},{2000,60},{3500,60},{2000,60},{3500,60},{2000,60},{3500,60},{2000,70}};
+static const SirenStep SIREN_SAFE[]  = {{1000,150},{0,80},{2000,200}};
+
+static const SirenStep* activeSirenSteps = nullptr;
+static uint8_t        sirenStepCount     = 0;
+static uint8_t        sirenStepIdx       = 0;
+static unsigned long  sirenStepAt        = 0;
+
+void sirenPlay(const SirenStep* steps, uint8_t count) {
+    activeSirenSteps = steps; sirenStepCount = count; sirenStepIdx = 0;
+    sirenStepAt = millis();
+    if (steps[0].freq > 0) {
+        ledcWriteTone(PIN_BUZZER, steps[0].freq);
+        ledcWrite(PIN_BUZZER, 128); // 50% volume
+    } else {
+        ledcWrite(PIN_BUZZER, 0);   // Mute
+    }
+}
+
+void sirenUpdate() {
+    if (!activeSirenSteps) return;
+    if ((millis() - sirenStepAt) < activeSirenSteps[sirenStepIdx].dur_ms) return;
     
-    // Wait for Serial Monitor to connect (ESP32-C3 USB CDC fix)
-    delay(2000);  // ← ADD THIS
-    while (!Serial && millis() < 5000) {
-        delay(10);  // Wait up to 5 seconds for Serial Monitor
+    if (++sirenStepIdx >= sirenStepCount) { 
+        activeSirenSteps = nullptr; 
+        ledcWrite(PIN_BUZZER, 0); // Mute
+        return;
     }
     
-    Serial.println("\n\n=== SAFECHAIN LITE v2.0 ===");
-    
-    // Storage
+    sirenStepAt = millis();
+    if (activeSirenSteps[sirenStepIdx].freq > 0) {
+        ledcWriteTone(PIN_BUZZER, activeSirenSteps[sirenStepIdx].freq);
+        ledcWrite(PIN_BUZZER, 128);
+    } else {
+        ledcWrite(PIN_BUZZER, 0);
+    }
+}
+
+// ============================================================
+// [FIX] Direct SPI register read (LoRa.readRegister() is private)
+// ============================================================
+uint8_t readLoRaRegister(uint8_t reg) {
+    digitalWrite(SS_PIN, LOW);
+    SPI.transfer(reg & 0x7F);
+    uint8_t val = SPI.transfer(0x00);
+    digitalWrite(SS_PIN, HIGH);
+    return val;
+}
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+void    handleCommand(String cmd);
+void    sendTestPacket();
+void    triggerFlood();
+void    triggerFire();
+void    triggerCrime();
+void    triggerSafe();
+void    onGPSInject(float lat, float lon);
+void    onBLECommand(String cmd);
+void    flashRGB(int r, int g, int b, int times);
+uint8_t getBatteryLevel();
+bool    loraReinit();
+void    checkLoraHealth();
+void    printMenu();
+void    sendHeartbeat(); // [M5]
+void    handleConfigFrame(const sc::SafeChainFrameV1 &frame); // [M6]
+void    loadNodePSK();
+
+// ============================================================
+// PSK loader — shared between setup() and setpsk command
+// ============================================================
+void loadNodePSK() {
+    storage.getPSK(nodePSK, sc::PSK_LEN);
+    emergency.reloadPSK();
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    while (!Serial && millis() < 5000) delay(10);
+
+    bootCount++;
+    Serial.printf("\n\n=== SAFECHAIN NODE v2.2 (Boot #%d) ===\n", bootCount);
+    DebugLog::init(LOG_LEVEL_DEFAULT);
+
+    // [M1-2] Reboot reason
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char* rs = "unknown";
+    switch (reason) {
+        case ESP_RST_POWERON:   rs = "power-on";           break;
+        case ESP_RST_BROWNOUT:  rs = "brownout";           break;
+        case ESP_RST_TASK_WDT:  rs = "TASK-WATCHDOG";      break;
+        case ESP_RST_INT_WDT:   rs = "INTERRUPT-WATCHDOG"; break;
+        case ESP_RST_PANIC:     rs = "panic";              break;
+        case ESP_RST_DEEPSLEEP: rs = "deep-sleep-wakeup";  break;
+        case ESP_RST_SW:        rs = "software";           break;
+        default: break;
+    }
+    Serial.printf(">>> Reset reason: %s\n", rs);
+    if (reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT)
+        Serial.println("!!! WATCHDOG RESET DETECTED !!!");
+
+    // [M1-1] Watchdog
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_S * 1000, .idle_core_mask = 0, .trigger_panic = true
+    };
+    esp_err_t wdtErr = esp_task_wdt_init(&wdt_config);
+    if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdt_config);
+    esp_err_t addErr = esp_task_wdt_add(NULL);
+    if (addErr != ESP_OK && addErr != ESP_ERR_INVALID_STATE)
+        Serial.printf(">>> WDT add failed: %d\n", (int)addErr);
+    esp_task_wdt_reset();
+
     storage.init();
     nodeID = storage.getNodeID();
-    Serial.printf(">>> Node ID: %s\n", nodeID.c_str());
-    
-    // Buzzer
-    pinMode(PIN_BUZZER, OUTPUT);
-    digitalWrite(PIN_BUZZER, LOW);
-    
-    // LED
-    led.init();
-    led.flash(50, 50, 50, 1);
-    
-   // === Buttons ===
-    
-    // 1. Increase Debounce Time to 80ms to forgive jittery/bouncing metal contacts
-    btnFlood.setDebounceMs(80);
-    btnFire.setDebounceMs(80);
-    btnCrime.setDebounceMs(80);
+    loadNodePSK(); // [M3]
 
-    // 2. Set the Hold duration to 1.5 seconds (1500ms) for better emergency UX
-    btnFlood.setPressMs(1200);
-    btnFire.setPressMs(1200);
-    btnCrime.setPressMs(1200);
+    // [M6] Load runtime-adjustable config from NVS
+    LoRa.setTxPower(storage.getTxPower());
+    heartbeatIntervalMs = storage.getHBInterval();
+    Serial.printf(">>> Node ID: %s | PSK: %s\n",
+        nodeID.c_str(), storage.hasPSK() ? "provisioned" : "dev-default");
+    Serial.printf("NODE FW=v2.2 | V1_SIZE=%u\n", (unsigned)sizeof(sc::SafeChainFrameV1));
 
-    // 3. Attach LONG PRESS to trigger the actual emergencies
+
+     #if defined(BOARD_ESP32_S3_SUPER_MINI) || defined(BOARD_ESP32_C3_SUPER_MINI)
+        ledcAttach(PIN_BUZZER, 2000, 8); // Attach to 2kHz, 8-bit resolution
+        ledcWrite(PIN_BUZZER, 0);        // 0% volume
+    #else
+        pinMode(PIN_BUZZER, OUTPUT);
+        digitalWrite(PIN_BUZZER, LOW);
+    #endif
+
+    btnFlood.setDebounceMs(80); btnFlood.setPressMs(1200);
+    btnFire .setDebounceMs(80); btnFire .setPressMs(1200);
+    btnCrime.setDebounceMs(80); btnCrime.setPressMs(1200);
     btnFlood.attachLongPressStart(triggerFlood);
-    btnFire.attachLongPressStart(triggerFire);
+    btnFire .attachLongPressStart(triggerFire);
     btnCrime.attachLongPressStart(triggerCrime);
-    
-    // 4. Attach DOUBLE CLICK to the new "Safe" function
     btnFlood.attachDoubleClick(triggerSafe);
-    btnFire.attachDoubleClick(triggerSafe);
+    btnFire .attachDoubleClick(triggerSafe);
     btnCrime.attachDoubleClick(triggerSafe);
-    
-    // GPS
+
     gpsManager.init();
-    
-    // BLE
+    esp_task_wdt_reset();
+
     ble.init(nodeID.c_str());
     ble.setGPSInjectCallback(onGPSInject);
     ble.setCommandCallback(onBLECommand);
-    
-    // Router
-    router.init(nodeID.c_str(), storage.getRelayEnabled());
-    
-    // Emergency
-    emergency.init(nodeID.c_str());
-    
-    // LoRa
+    esp_task_wdt_reset();
+
+
+    emergency.init(nodeID.c_str(), &storage); // [M3] loads PSK inside init()
+
     SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
     LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
-    
     if (!LoRa.begin(LORA_FREQ)) {
-        Serial.println("❌ LoRa Init Failed!");
+        Serial.println("LoRa Init Failed!");
         led.setColor(255, 0, 0);
-        while(1);
+        while (1) { esp_task_wdt_reset(); delay(1000); }
     }
-    
     LoRa.setSpreadingFactor(storage.getSpreadingFactor());
     LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR);
@@ -141,495 +237,486 @@ void setup() {
     LoRa.enableCrc();
     LoRa.setSyncWord(LORA_SYNCWORD);
     LoRa.setTxPower(LORA_TXPOWER);
-    
-    randomSeed(analogRead(0));
-    LoRa.sleep();
-
-    // To this:
+    randomSeed(esp_random());
     LoRa.receive();
- 
-    
-    
-    // === DEEP SLEEP WAKE-UP HANDLER ===
-    // 1. Ask the ESP32 why it just booted up
-    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    
-    // 👇 FIX: Check for EXT1 wakeup
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-        Serial.println("\n⚠️ WOKE UP FROM DEEP SLEEP VIA BUTTON!");
-        
-        // 👇 FIX: Ask the EXT1 controller exactly WHICH pin triggered the wake-up
-        uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+    esp_task_wdt_reset();
 
-        // 4. Instantly trigger the correct emergency!
-        if (wakeup_pin_mask & (1ULL << PIN_BTN_FLOOD)) {
-            Serial.println(">>> WAKEUP REASON: FLOOD BUTTON");
-            triggerFlood();
-            
-        } else if (wakeup_pin_mask & (1ULL << PIN_BTN_FIRE)) {
-            Serial.println(">>> WAKEUP REASON: FIRE BUTTON");
-            triggerFire();
-            
-        } else if (wakeup_pin_mask & (1ULL << PIN_BTN_CRIME)) {
-            Serial.println(">>> WAKEUP REASON: CRIME BUTTON");
-            triggerCrime();
-        }
-        
+    // [M0-4] Resume before wakeup
+    bool resumed = emergency.resumePending();
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    uint64_t wakeup_pin_mask = 0;
+    #if defined(BOARD_ESP32_S3_SUPER_MINI)
+        if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1)
+            wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+    #elif defined(BOARD_ESP32_C3_SUPER_MINI)
+        if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO)
+            wakeup_pin_mask = esp_sleep_get_gpio_wakeup_status();
+    #endif
+
+    if (!resumed && wakeup_pin_mask != 0) {
+        Serial.println(">>> WOKE FROM DEEP SLEEP VIA BUTTON");
+        if      (wakeup_pin_mask & (1ULL << PIN_BTN_FLOOD)) triggerFlood();
+        else if (wakeup_pin_mask & (1ULL << PIN_BTN_FIRE))  triggerFire();
+        else if (wakeup_pin_mask & (1ULL << PIN_BTN_CRIME)) triggerCrime();
+    } else if (resumed) {
+        Serial.println(">>> Skipped wakeup — NVS pending event has priority");
     } else {
-        // Normal power-on or manual reset button
-        Serial.println("\n>>> Normal Boot / Power On");
+        Serial.println(">>> Normal Boot / Power On");
     }
 
-    Serial.println("✅ LoRa Ready (SF12 + CRC + SYNC)");
-    Serial.println("\n--- Ready for Commands ---");
+    lastActivityTime    = millis();
+    lastLoraHealthCheck = millis();
+    esp_task_wdt_reset();
+
+    Serial.println("LoRa Ready (SF11 + CRC + AUTH)");
     printMenu();
 }
 
-// === MAIN LOOP ===
+// ============================================================
+// MAIN LOOP
+// ============================================================
 void loop() {
-    // Button ticks
-    btnFlood.tick();
-    btnFire.tick();
-    btnCrime.tick();
-    
-    // GPS update
+    esp_task_wdt_reset();
+
+    btnFlood.tick(); btnFire.tick(); btnCrime.tick();
+    sirenUpdate();
     gpsManager.update();
-    
-    // BLE update
     ble.update();
-    
-    // Emergency state machine
     emergency.update();
-    
-    // Router relay processing
-    router.update();
-    
-    // LoRa RX
+
     int packetSize = LoRa.parsePacket();
-    if (packetSize == sizeof(SafeChainPacket)) {
-        SafeChainPacket rxPkt;
-        LoRa.readBytes((uint8_t*)&rxPkt, sizeof(SafeChainPacket));
-        
-        if (PacketBuilder::validate(rxPkt)) {
-            rxPkt.rssi = LoRa.packetRssi();  // Store RSSI
-            
-            Serial.printf("\n[LORA RX] ");
-            PacketBuilder::print(rxPkt);
-            Serial.printf("RSSI: %d dBm\n", rxPkt.rssi);
-            
-            led.flash(0, 255, 255, 2);  // Cyan
-            
-            // Handle ACK
-            if (rxPkt.msgType == MSG_ACK) {
-                emergency.handleACK(rxPkt);
-            }
-            
-            // Queue relay if applicable
-            if (router.shouldRelay(rxPkt)) {
-                led.flash(255, 0, 255, 1);  // Magenta
-                router.queueRelay(rxPkt);
-            }
+
+    if (packetSize == sizeof(sc::SafeChainFrameV1)) {
+        sc::SafeChainFrameV1 rxFrame;
+        LoRa.readBytes((uint8_t*)&rxFrame, sizeof(sc::SafeChainFrameV1));
+
+        // [M3] validateFrame now checks both CRC16 and HMAC
+        if (sc::Protocol::validateFrame(rxFrame, nodePSK, sc::PSK_LEN)) {
+            rxFrame.last_rssi_dbm = LoRa.packetRssi();
+            Serial.printf("\n[RX V1] Frame=%s Event=%s EventID=%lu Hop=%u RSSI=%d auth=OK\n",
+                sc::Protocol::frameTypeName(rxFrame.frame_type),
+                sc::Protocol::eventTypeName(rxFrame.event_type),
+                (unsigned long)rxFrame.event_id, rxFrame.hop_count, rxFrame.last_rssi_dbm);
+            led.flash(0, 255, 255, 1);
+            if (rxFrame.frame_type == sc::FRAME_ACK)
+                emergency.handleACK(rxFrame);
+            else if (rxFrame.frame_type == sc::FRAME_CONFIG)
+                handleConfigFrame(rxFrame); // [M6]
         } else {
-            Serial.println(">>> CRC FAIL - Dropped");
+            Serial.println(">>> VALIDATE FAIL - CRC or AUTH mismatch — Dropped");
         }
-    }
-    
-    // LED status update
-    if (millis() - lastLedUpdate > LED_UPDATE_INTERVAL) {
-        lastLedUpdate = millis();
-        led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
+
+    } else if (packetSize > 0) {
+        while (LoRa.available()) LoRa.read();
+        Serial.printf(">>> WARNING: Unknown packet size: %d\n", packetSize);
     }
 
-    // 👇 ADD THIS ENTIRE BLOCK: Low Battery Warning
-    if (millis() - lastBatteryWarnTime > BATTERY_WARN_INTERVAL) {
-        lastBatteryWarnTime = millis();
-        
-        // Check if the battery is 15% or lower
-        if (getBatteryLevel() <= 15) {
-            Serial.println("⚠️ WARNING: Low Battery!");
-            
-            // Flash Red twice quickly to grab the user's attention
-            led.flash(255, 0, 0, 2); 
-            
-            // Restore the normal Bluetooth/GPS dim color after flashing
-            led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
-        }
+    checkLoraHealth();
+
+    if ((millis() - lastLedUpdate) > LED_UPDATE_INTERVAL) {
+        lastLedUpdate = millis();
+        EmergencyState emState = emergency.getState();
+        if      (emState == EM_STATE_WAITING_ACK) led.flash(255, 165, 0, 1);
+        else if (emState == EM_STATE_FAILED)       led.flash(255, 0,   0, 1);
+        else if (emState == EM_STATE_CONFIRMED)    led.flash(0,   255, 0, 1);
+        else                                       led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
     }
-    
-    // BLE periodic update
-    if (ble.isConnected() && millis() - lastBleUpdate > BLE_UPDATE_INTERVAL) {
+
+    if ((millis() - lastBatteryWarnTime) > BATTERY_WARN_INTERVAL) {
+        lastBatteryWarnTime = millis();
+        if (getBatteryLevel() <= 15) { Serial.println("WARNING: Low Battery!"); led.flash(255, 0, 0, 2); }
+    }
+
+    if (ble.isConnected() && (millis() - lastBleUpdate) > BLE_UPDATE_INTERVAL) {
         lastBleUpdate = millis();
         float lat, lon;
         gpsManager.determineLocation(lat, lon, false);
-        String update = String(lat, 6) + "," + String(lon, 6);
-        ble.send(update);
+        ble.send(String(lat, 6) + "," + String(lon, 6));
     }
-    
-    // Auto mode
-    if (autoMode && millis() - lastAutoTime > AUTO_MODE_INTERVAL) {
+
+    if (autoMode && (millis() - lastAutoTime) > AUTO_MODE_INTERVAL) {
         lastAutoTime = millis();
-        Serial.println("\n[AUTO] Triggering test...");
         sendTestPacket();
     }
-    
-    // Serial commands
+
+    // [M5] Periodic heartbeat — only while idle, avoids colliding with emergency TX
+    if (emergency.getState() == EM_STATE_IDLE &&
+        (millis() - lastHeartbeatTime) >= heartbeatIntervalMs) { // [M6] runtime interval
+        lastHeartbeatTime = millis();
+        sendHeartbeat();
+    }
+
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
         handleCommand(cmd);
     }
-    
+
     delay(10);
 
-    // === DEEP SLEEP CHECK ===
-    // If no emergencies are active, check if it's time to sleep
     if (emergency.getState() == EM_STATE_IDLE) {
-        
-        // Reset the timer if a button is being pressed or BLE is actively receiving data
-        if (btnFlood.isLongPressed() || btnFire.isLongPressed() || btnCrime.isLongPressed()) {
+        if (btnFlood.isLongPressed() || btnFire.isLongPressed() || btnCrime.isLongPressed())
             lastActivityTime = millis();
-        }
-
-        // If 3 minutes have passed with no activity...
-        if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
-            Serial.println("\n💤 Activity timeout reached. Entering Deep Sleep...");
-            ble.send("💤 Node entering Deep Sleep to save battery.");
-            delay(500); // Give BLE time to send the message
-
-            // Turn off LED and LoRa module
-            led.off();
-            LoRa.sleep();
-
-            // 👇 THE S3 FIX: Tell the RTC processor to hold the pull-ups ON during sleep!
-            rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_FLOOD);
-            rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_FIRE);
-            rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_CRIME);
-
-            // Disable pull-downs just to be absolutely safe
-            rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_FLOOD);
-            rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_FIRE);
-            rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_CRIME);
-
-            // Configure the Buttons to wake up the ESP32 (Active LOW)
-            // Note: Use esp_sleep_enable_ext1_wakeup for S3, or esp_deep_sleep_enable_gpio_wakeup for C3.
-            // Using a bitmask to listen to all 3 buttons simultaneously
-            // 👇 FIX: Use the EXT1 controller for multiple pins
-            uint64_t wakeMask = (1ULL << PIN_BTN_FLOOD) | (1ULL << PIN_BTN_FIRE) | (1ULL << PIN_BTN_CRIME);
-            esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_LOW);
-
-            // GO TO SLEEP
+        if ((millis() - lastActivityTime) > SLEEP_TIMEOUT) {
+            Serial.println("\nEntering Deep Sleep...");
+            ble.send("Node entering Deep Sleep.");
+            delay(400); led.off(); LoRa.sleep();
+            uint64_t wakeMask = (1ULL << PIN_BTN_FLOOD) | (1ULL << PIN_BTN_FIRE);
+            #if defined(BOARD_ESP32_S3_SUPER_MINI)
+                rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_FLOOD);
+                rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_FIRE);
+                rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_CRIME);
+                rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_FLOOD);
+                rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_FIRE);
+                rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_CRIME);
+                esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_LOW);
+            #elif defined(BOARD_ESP32_C3_SUPER_MINI)
+                pinMode(PIN_BTN_FLOOD, INPUT_PULLUP);
+                pinMode(PIN_BTN_FIRE,  INPUT_PULLUP);
+                pinMode(PIN_BTN_CRIME, INPUT_PULLUP);
+                gpio_hold_en((gpio_num_t)PIN_BTN_FLOOD);
+                gpio_hold_en((gpio_num_t)PIN_BTN_FIRE);
+                gpio_hold_en((gpio_num_t)PIN_BTN_CRIME);
+                gpio_deep_sleep_hold_en();
+                esp_deep_sleep_enable_gpio_wakeup(wakeMask, ESP_GPIO_WAKEUP_GPIO_LOW);
+            #endif
             esp_deep_sleep_start();
         }
     } else {
-        // If an emergency is active, constantly reset the sleep timer!
         lastActivityTime = millis();
     }
 }
 
-// === HELPERS ===
+// ============================================================
+// LoRa reinit [M1-3]
+// ============================================================
+bool loraReinit() {
+    Serial.printf(">>> LoRa reinit (fault #%lu)...\n", (unsigned long)(loraFaultCount + 1));
+    LoRa.end(); delay(150);
+    pinMode(RST_PIN, OUTPUT);
+    digitalWrite(RST_PIN, HIGH); delay(10);
+    digitalWrite(RST_PIN, LOW);  delay(10);
+    digitalWrite(RST_PIN, HIGH); delay(20);
+    bool ok = false;
+    for (int i = 1; i <= 3; i++) { if (LoRa.begin(LORA_FREQ)) { ok = true; break; } delay(200); }
+    if (!ok) { loraFaultCount++; loraReinitCount++; return false; }
+    LoRa.setSpreadingFactor(storage.getSpreadingFactor());
+    LoRa.setSignalBandwidth(LORA_BW); LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE); LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD); LoRa.setTxPower(LORA_TXPOWER); LoRa.receive();
+    loraReinitCount++;
+    Serial.printf(">>> LoRa reinit OK (#%d)\n", loraReinitCount);
+    return true;
+}
+
+void checkLoraHealth() {
+    if ((millis() - lastLoraHealthCheck) < LORA_HEALTH_CHECK_INTERVAL_MS) return;
+    if (emergency.getState() == EM_STATE_PENDING_TX) return;
+    lastLoraHealthCheck = millis();
+    LoRa.receive();
+    uint8_t v = readLoRaRegister(0x42);
+    if (v != 0x12) { Serial.printf(">>> LoRa health FAIL: 0x%02X\n", v); loraFaultCount++; loraReinit(); }
+    else Serial.printf(">>> LoRa health OK | faults=%lu\n", (unsigned long)loraFaultCount);
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
 void flashRGB(int r, int g, int b, int times) {
     led.flash(r, g, b, times);
     led.updateStatus(ble.isConnected(), gpsManager.isGPSValid());
 }
 
 uint8_t getBatteryLevel() {
-   // 👇 NEW: Take 10 rapid samples and average them to eliminate ADC noise!
-    uint32_t totalMilliVolts = 0;
-    for (int i = 0; i < 10; i++) {
-        totalMilliVolts += analogReadMilliVolts(PIN_BATTERY);
-        delay(2); 
-    }
-    float pinMilliVolts = totalMilliVolts / 10.0;
-
-    // Convert to Volts
-    float pinVoltage = pinMilliVolts / 1000.0;
-    
-    // Multiply by 2 because our resistors cut the battery voltage in half
-    float batteryVoltage = pinVoltage * 2.0;
-    
-    // Debug print so you can verify the reading in your Serial Monitor
-    Serial.printf(">>> Battery Read: %.2fV\n", batteryVoltage);
-
-    // Hard limits for a 3.7V LiPo
-    if (batteryVoltage >= 4.20) return 100;
-    if (batteryVoltage <= 3.20) return 0;
-    
-    // Accurate LiPo Discharge Curve Mapping
-    float percentage;
-    if (batteryVoltage >= 3.80) {
-        // Top 50% of the battery is between 3.80V and 4.20V
-        percentage = 50.0 + ((batteryVoltage - 3.80) / (4.20 - 3.80)) * 50.0;
-    } else {
-        // Bottom 50% drops extremely fast between 3.20V and 3.80V
-        percentage = ((batteryVoltage - 3.20) / (3.80 - 3.20)) * 50.0;
-    }
-    
-    return (uint8_t)percentage;
+    uint32_t total = 0;
+    for (int i = 0; i < 10; i++) { total += analogReadMilliVolts(PIN_BATTERY); delay(2); }
+    float v = (total / 10.0f / 1000.0f) * 2.0f;
+    if (v >= 4.20f) return 100;
+    if (v <= 3.20f) return 0;
+    return (uint8_t)(v >= 3.80f
+        ? 50.0f + ((v - 3.80f) / 0.40f) * 50.0f
+        : ((v - 3.20f) / 0.60f) * 50.0f);
 }
 
 void sendTestPacket() {
     float lat, lon;
     gpsManager.determineLocation(lat, lon, true);
-    
-    SafeChainPacket pkt;
-    PacketBuilder::build(pkt, nodeID.c_str(), MSG_TEST, 
-                         EM_NONE, lat, lon, getBatteryLevel());
-                         
-    router.cancelRelay();  // Priority override
-    
-    // 👇 Update Terminal and BLE
-    Serial.println(">>> SENDING TEST...");
-    ble.send("📡 SENDING TEST PING...");
-    
-    flashRGB(255, 255, 255, 2);
-    tone(PIN_BUZZER, 3000, 100); // Quick chirp
-    
-    LoRa.idle();
-    LoRa.beginPacket();
-    LoRa.write((uint8_t*)&pkt, sizeof(SafeChainPacket));
-    LoRa.endPacket(); 
-    
-    LoRa.receive();
-    
-    // 👇 Update Terminal and BLE
-    Serial.println(">>> SENT!");
-    ble.send("✅ TEST PACKET AIRBORNE!");
+    bool gpsValid   = !(lat == 0.0f && lon == 0.0f);
+    bool lowBattery = getBatteryLevel() <= 15;
+    sc::SafeChainFrameV1 frame;
+    sc::Protocol::buildEventFrame(
+        frame, nodeID.c_str(), nodeID.c_str(),
+        0,                          // event_id 0 = test, not stored in journal
+        sc::EVENT_TEST,
+        0, millis(),
+        (int32_t)(lat * 10000000.0f),
+        (int32_t)(lon * 10000000.0f),
+        getBatteryLevel(), gpsValid, lowBattery,
+        nodePSK, sc::PSK_LEN
+    );
+    Serial.println(">>> SENDING V1 TEST...");
+    ble.send("SENDING V1 TEST PING...");
+    led.flash(255, 255, 255, 2); 
+    ledcWriteTone(PIN_BUZZER, 3000);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(100);
+    ledcWrite(PIN_BUZZER, 0);
+    LoRa.idle(); LoRa.beginPacket();
+    LoRa.write((uint8_t*)&frame, sizeof(sc::SafeChainFrameV1));
+    LoRa.endPacket(); LoRa.receive();
+    Serial.println(">>> SENT!"); ble.send("V1 TEST PACKET AIRBORNE!");
 }
 
-//
-
-// void triggerFlood() {
-//     Serial.println("\n🚨 FLOOD DETECTED!");
-//     ble.send("🚨 FLOOD");
-//     led.flash(0, 0, 255, 2);
-    
-//     // Quick, single sonar ping
-//     tone(PIN_BUZZER, 2000, 400); 
-//     delay(400);
-
-//     float lat, lon;
-//     gpsManager.determineLocation(lat, lon, true);
-//     emergency.trigger(EM_FLOOD, lat, lon, getBatteryLevel());
-// }
-
-// void triggerFire() {
-//     Serial.println("\n🚨 FIRE DETECTED!");
-//     ble.send("🚨 FIRE");
-//     led.flash(255, 50, 0, 2);
-    
-//     // Just ONE cycle of the European Hi-Lo pattern
-//     tone(PIN_BUZZER, 1000, 300); delay(300); 
-//     tone(PIN_BUZZER, 2500, 300); delay(300); 
-
-//     float lat, lon;
-//     gpsManager.determineLocation(lat, lon, true);
-//     emergency.trigger(EM_FIRE, lat, lon, getBatteryLevel());
-// }
-
-// void triggerCrime() {
-//     Serial.println("\n🚨 CRIME DETECTED!");
-//     ble.send("🚨 CRIME");
-//     led.flash(255, 0, 0, 2);
-    
-//     // One quick, aggressive sweep (Police Yelp)
-//     for(int f=1000; f<=3500; f+=200) { 
-//         tone(PIN_BUZZER, f, 20);
-//         delay(20); 
-//     }
-
-//     float lat, lon;
-//     gpsManager.determineLocation(lat, lon, true);
-//     emergency.trigger(EM_CRIME, lat, lon, getBatteryLevel());
-// }
-
-// Button Sirens code
-
 void triggerFlood() {
-    Serial.println("\n🚨 FLOOD DETECTED!");
-    ble.send("🚨 FLOOD");
-    led.flash(0, 0, 255, 2);
-
-    // Siren: Slow "Sonar" Ping (High Pitch)
-    for(int i=0; i<3; i++) { 
-      tone(PIN_BUZZER, 2000, 300); 
-      delay(600); 
-    }
-
-    float lat, lon;
-    gpsManager.determineLocation(lat, lon, true);
+    led.setColor(0, 0, 255); ble.send("FLOOD");
+    float lat, lon; gpsManager.determineLocation(lat, lon, true);
     emergency.trigger(EM_FLOOD, lat, lon, getBatteryLevel());
+    sirenPlay(SIREN_FLOOD, sizeof(SIREN_FLOOD)/sizeof(SIREN_FLOOD[0]));
 }
 
 void triggerFire() {
-    Serial.println("\n🚨 FIRE DETECTED!");
-    ble.send("🚨 FIRE");
-    led.flash(255, 50, 0, 2);
-
-    // Siren: Fast European Hi-Lo pattern
-    for(int i=0; i<4; i++) { 
-      tone(PIN_BUZZER, 1000, 300); delay(300); 
-      tone(PIN_BUZZER, 2500, 300); delay(300); 
-    }
-
-    float lat, lon;
-    gpsManager.determineLocation(lat, lon, true);
+    led.setColor(255, 50, 0); ble.send("FIRE");
+    float lat, lon; gpsManager.determineLocation(lat, lon, true);
     emergency.trigger(EM_FIRE, lat, lon, getBatteryLevel());
+    sirenPlay(SIREN_FIRE, sizeof(SIREN_FIRE)/sizeof(SIREN_FIRE[0]));
 }
 
 void triggerCrime() {
-    Serial.println("\n🚨 CRIME DETECTED!");
-    ble.send("🚨 CRIME");
-    led.flash(255, 0, 0, 2);
-
-    // Siren: Aggressive fast sweep (Police Yelp)
-    for(int i=0; i<4; i++) {
-      for(int f=1000; f<=3500; f+=100) { 
-        tone(PIN_BUZZER, f, 15); delay(15); 
-      }
-    }
-
-    float lat, lon;
-    gpsManager.determineLocation(lat, lon, true);
+    led.setColor(255, 0, 0); ble.send("CRIME");
+    float lat, lon; gpsManager.determineLocation(lat, lon, true);
     emergency.trigger(EM_CRIME, lat, lon, getBatteryLevel());
+    sirenPlay(SIREN_CRIME, sizeof(SIREN_CRIME)/sizeof(SIREN_CRIME[0]));
 }
 
 void triggerSafe() {
-
-    // 👇 FIX 1: Instantly kill the GPS Refinement Watchdog!
-    needsGPSRefine = false;
-
-    // Only allow marking "SAFE" if an alert is currently active or retrying
-    if (emergency.getState() != EM_STATE_IDLE) {
-        Serial.println("\n✅ SAFE SIGNAL INITIATED!");
-        ble.send("✅ MARKED SAFE - Cancelling Alert...");
-        
-        // Flash Green to indicate safety
-        led.flash(0, 255, 0, 3);
-        
-        // Play a happy "All Clear" double-tone
-        tone(PIN_BUZZER, 1000, 150); delay(150);
-        tone(PIN_BUZZER, 2000, 150);
-        
-        float lat, lon;
-        gpsManager.determineLocation(lat, lon, true);
-        
-        // This will override the current emergency and broadcast EM_SAFE (0x04) to the Gateway!
-        emergency.trigger(EM_SAFE, lat, lon, getBatteryLevel());
-    } else {
-        Serial.println("\nℹ️ System is already idle. Safe signal ignored.");
-    }
+    if (emergency.getState() == EM_STATE_IDLE) { Serial.println(">>> Already idle."); return; }
+    led.setColor(0, 255, 0); ble.send("MARKED SAFE");
+    float lat, lon; gpsManager.determineLocation(lat, lon, true);
+    emergency.trigger(EM_SAFE, lat, lon, getBatteryLevel());
+    sirenPlay(SIREN_SAFE, sizeof(SIREN_SAFE)/sizeof(SIREN_SAFE[0]));
 }
 
-
-void onGPSInject(float lat, float lon) {
-    gpsManager.injectBLE(lat, lon);
-}
-
-void onBLECommand(String cmd) {
-    Serial.printf("[BLE CMD]: %s\n", cmd.c_str());
-    handleCommand(cmd);
-}
+void onGPSInject(float lat, float lon) { gpsManager.injectBLE(lat, lon); }
+void onBLECommand(String cmd) { handleCommand(cmd); }
 
 void handleCommand(String input) {
-    input.trim();
-    input.toLowerCase();
-    
+    input.trim(); input.toLowerCase();
     int spaceIdx = input.indexOf(' ');
     String cmd = (spaceIdx == -1) ? input : input.substring(0, spaceIdx);
     String arg = (spaceIdx == -1) ? "" : input.substring(spaceIdx + 1);
-    
     String response = "";
-    
-    if (cmd == "flood") { triggerFlood(); }
-    else if (cmd == "fire") { triggerFire(); }
-    else if (cmd == "crime") { triggerCrime(); }
-    else if (cmd == "send") { sendTestPacket(); }
+
+    if      (cmd == "flood")  { triggerFlood(); }
+    else if (cmd == "fire")   { triggerFire(); }
+    else if (cmd == "crime")  { triggerCrime(); }
+    else if (cmd == "safe")   { triggerSafe(); }
+    else if (cmd == "send")   { sendTestPacket(); }
     else if (cmd == "gps") {
-        float lat, lon;
-        gpsManager.determineLocation(lat, lon, true);
-        response = "GPS: " + String(lat, 6) + ", " + String(lon, 6) + 
-                   " (" + gpsManager.getSourceName() + ")";
+        float lat, lon; gpsManager.determineLocation(lat, lon, true);
+        response = "GPS: " + String(lat,6) + ", " + String(lon,6) + " (" + gpsManager.getSourceName() + ")";
     }
     else if (cmd == "relay") {
-        if (arg == "on") {
-            router.setRelayEnabled(true);
-            storage.setRelayEnabled(true);
-            response = "Relay: ON";
-        } else if (arg == "off") {
-            router.setRelayEnabled(false);
-            storage.setRelayEnabled(false);
-            response = "Relay: OFF";
-        } else {
-            response = "Relay: " + String(router.getRelayEnabled() ? "ON" : "OFF");
-        }
+        // [M4] Node no longer relays legacy packets — relay setting preserved for future V1 relay support
+        response = "Relay: disabled in M4 (V1-only mode)";
     }
     else if (cmd == "uid") {
-        if (arg.length() > 0) {
-            nodeID = arg.substring(0, 5);  // Max 5 chars
-            storage.setNodeID(nodeID);
-            response = "UID saved: " + nodeID + " (reboot required)";
-        } else {
-            response = "Current UID: " + nodeID;
-        }
+        if (arg.length() > 0) { nodeID = arg.substring(0,5); storage.setNodeID(nodeID); response = "UID saved: " + nodeID + " (reboot)"; }
+        else                   { response = "Current UID: " + nodeID; }
     }
     else if (cmd == "sf") {
-        if (arg.length() > 0) {
-            uint8_t sf = arg.toInt();
-            if (sf >= 7 && sf <= 12) {
-                storage.setSpreadingFactor(sf);
-                LoRa.setSpreadingFactor(sf);
-                response = "SF set to " + String(sf);
-            }
-        } else {
-            response = "Current SF: " + String(storage.getSpreadingFactor());
-        }
+        if (arg.length() > 0) { uint8_t sf = arg.toInt(); if (sf>=7&&sf<=12) { storage.setSpreadingFactor(sf); LoRa.setSpreadingFactor(sf); response = "SF=" + String(sf); } }
+        else                   { response = "SF=" + String(storage.getSpreadingFactor()); }
     }
     else if (cmd == "auto") {
-        if (arg == "on") {
-            autoMode = true;
-            response = "Auto mode: ON";
-        } else if (arg == "off") {
-            autoMode = false;
-            response = "Auto mode: OFF";
+        if      (arg == "on")  { autoMode = true;  response = "Auto: ON"; }
+        else if (arg == "off") { autoMode = false; response = "Auto: OFF"; }
+        else                   { response = "Auto: " + String(autoMode ? "ON" : "OFF"); }
+    }
+    // --------------------------------------------------------
+    // [M3] setpsk <32 hex chars> — provision a 16-byte PSK
+    // Example: setpsk 0102030405060708090a0b0c0d0e0f10
+    // --------------------------------------------------------
+    else if (cmd == "setpsk") {
+        if (arg.length() == 32) {
+            uint8_t newKey[sc::PSK_LEN];
+            bool ok = true;
+            for (int i = 0; i < sc::PSK_LEN; i++) {
+                String byteStr = arg.substring(i * 2, i * 2 + 2);
+                long val = strtol(byteStr.c_str(), nullptr, 16);
+                if (val < 0 || val > 255) { ok = false; break; }
+                newKey[i] = (uint8_t)val;
+            }
+            if (ok) {
+                storage.setPSK(newKey, sc::PSK_LEN);
+                loadNodePSK();
+                response = "PSK provisioned. Reboot to apply fully.";
+            } else {
+                response = "Invalid hex — use 32 hex chars (e.g. 0102...0f10)";
+            }
         } else {
-            response = "Auto mode: " + String(autoMode ? "ON" : "OFF");
+            response = "Usage: setpsk <32 hex chars>";
         }
     }
+    // [M3] showpsk — display current PSK status and first 4 bytes
+    else if (cmd == "showpsk") {
+        char buf[9];
+        snprintf(buf, sizeof(buf), "%02X%02X%02X%02X", nodePSK[0], nodePSK[1], nodePSK[2], nodePSK[3]);
+        response = "PSK: " + String(storage.hasPSK() ? "provisioned" : "dev-default")
+                 + " | first4=" + String(buf);
+    }
     else if (cmd == "info") {
-        response = "=== NODE INFO ===\n";
-        response += "UID: " + nodeID + "\n";
-        response += "MAC: " + ble.getMacAddress() + "\n"; // 👇 ADD THIS LINE
-        response += "Relay: " + String(router.getRelayEnabled() ? "ON" : "OFF") + "\n";
-        response += "SF: " + String(storage.getSpreadingFactor()) + "\n";
-        response += "BLE: " + String(ble.isConnected() ? "Connected" : "Disconnected") + "\n";
-        response += "GPS: " + String(gpsManager.isGPSValid() ? "Valid" : "No Fix");
+        response  = "=== NODE INFO ===\n";
+        response += "UID: "         + nodeID + "\n";
+        response += "MAC: "         + ble.getMacAddress() + "\n";
+        response += "SF: "          + String(storage.getSpreadingFactor()) + "\n";
+        response += "BLE: "         + String(ble.isConnected() ? "Connected" : "Disconnected") + "\n";
+        response += "GPS: "         + String(gpsManager.isGPSValid() ? "Valid" : "No Fix") + "\n";
+        response += "Battery: "     + String(getBatteryLevel()) + "%\n";
+        response += "PSK: "         + String(storage.hasPSK() ? "provisioned" : "dev-default") + "\n";
+        response += "LoRa faults: " + String(loraFaultCount) + " reinits: " + String(loraReinitCount) + "\n";
+        response += "Boot count: "  + String(bootCount);
     }
     else if (cmd == "reboot") {
-        response = "Rebooting...";
-        Serial.println(response);
-        ble.send(response);
-        delay(1000);
-        ESP.restart();
+        response = "Rebooting..."; Serial.println(response); ble.send(response); delay(500); ESP.restart();
     }
-    else {
-        response = "Unknown: " + cmd;
-        printMenu();
+    else { response = "Unknown: " + cmd; printMenu(); }
+
+    if (response != "") { Serial.println(response); ble.send(response); }
+}
+
+// ============================================================
+// [M5] HEARTBEAT — non-emergency liveness broadcast
+// Carries battery level and GPS location. No ACK requested.
+// Gateway uses this to track node online/offline status.
+// ============================================================
+void sendHeartbeat() {
+    float lat, lon;
+    gpsManager.determineLocation(lat, lon, false);
+    bool gpsValid   = !(lat == 0.0f && lon == 0.0f);
+    uint8_t batt    = getBatteryLevel();
+    bool lowBattery = batt <= 15;
+
+    sc::SafeChainFrameV1 frame;
+    sc::Protocol::initFrame(frame);
+    frame.frame_type = sc::FRAME_HEARTBEAT;
+    frame.event_type = sc::EVENT_NONE;
+    frame.flags      = 0; // no ACK needed
+    if (gpsValid)   frame.flags |= sc::FLAG_GPS_VALID;
+    if (lowBattery) frame.flags |= sc::FLAG_LOW_BATTERY;
+
+    strncpy(frame.origin_id, nodeID.c_str(), sc::DEVICE_ID_LEN - 1);
+    strncpy(frame.sender_id, nodeID.c_str(), sc::DEVICE_ID_LEN - 1);
+    frame.event_id      = 0; // heartbeat has no event_id
+    frame.attempt       = 0;
+    frame.hop_count     = 0;
+    frame.max_hops      = sc::MAX_HOPS_DEFAULT;
+    frame.event_time_ms = millis();
+    frame.lat_e7        = (int32_t)(lat * 10000000.0f);
+    frame.lon_e7        = (int32_t)(lon * 10000000.0f);
+    frame.battery_pct   = batt;
+    frame.last_rssi_dbm = 0;
+
+    sc::Protocol::finalizeFrame(frame, nodePSK, sc::PSK_LEN);
+
+    Serial.printf(">>> HEARTBEAT: batt=%u%% gps=%s\n",
+        batt, gpsValid ? "valid" : "none");
+
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&frame, sizeof(sc::SafeChainFrameV1));
+    LoRa.endPacket();
+    LoRa.receive();
+}
+
+// ============================================================
+// [M6] FRAME_CONFIG handler — applies OTA configuration
+// Validates target (nodeID or "ALL"), deduplicates by event_id,
+// applies live, persists to NVS so config survives reboot.
+// ============================================================
+void handleConfigFrame(const sc::SafeChainFrameV1 &frame) {
+    // Check if this config targets us or all nodes
+    bool targeted = (strncmp(frame.origin_id, nodeID.c_str(), sc::DEVICE_ID_LEN) == 0);
+    bool broadcast = (strncmp(frame.origin_id, sc::CONFIG_TARGET_ALL, sc::DEVICE_ID_LEN) == 0);
+    if (!targeted && !broadcast) return; // not for us
+
+    // Dedup: ignore if we already applied this config_id
+    if (frame.event_id != 0 && frame.event_id == storage.getLastConfigId()) {
+        Serial.printf(">>> CONFIG: duplicate event_id %lu — ignored\n",
+            (unsigned long)frame.event_id);
+        return;
     }
-    
-    if (response != "") {
-        Serial.println(response);
-        ble.send(response);
+
+    uint32_t value = frame.event_time_ms; // config_value packed here
+    sc::ConfigKey key = static_cast<sc::ConfigKey>(frame.event_type);
+
+    Serial.printf(">>> CONFIG RX: key=0x%02X value=%lu target=%s\n",
+        (uint8_t)key, (unsigned long)value,
+        broadcast ? "ALL" : nodeID.c_str());
+    ble.send("OTA CONFIG RECEIVED");
+
+    switch (key) {
+        case sc::CONFIG_SF: {
+            uint8_t sf = (uint8_t)value;
+            if (sf < 7 || sf > 12) {
+                Serial.printf(">>> CONFIG: SF %u out of range (7-12) — rejected\n", sf);
+                ble.send("CONFIG REJECTED: SF out of range");
+                return;
+            }
+            storage.setSpreadingFactor(sf);
+            LoRa.setSpreadingFactor(sf);
+            Serial.printf(">>> CONFIG APPLIED: SF=%u\n", sf);
+            ble.send("CONFIG: SF=" + String(sf));
+            break;
+        }
+        case sc::CONFIG_TX_POWER: {
+            uint8_t dbm = (uint8_t)value;
+            if (dbm < 2 || dbm > 20) {
+                Serial.printf(">>> CONFIG: TX power %u out of range (2-20) — rejected\n", dbm);
+                ble.send("CONFIG REJECTED: TX power out of range");
+                return;
+            }
+            storage.setTxPower(dbm);
+            LoRa.setTxPower(dbm);
+            Serial.printf(">>> CONFIG APPLIED: TXpower=%udBm\n", dbm);
+            ble.send("CONFIG: TXpower=" + String(dbm) + "dBm");
+            break;
+        }
+        case sc::CONFIG_HB_INTERVAL: {
+            if (value < 30000 || value > 1800000) {
+                Serial.printf(">>> CONFIG: HB interval %lu out of range (30s-30min) — rejected\n",
+                    (unsigned long)value);
+                ble.send("CONFIG REJECTED: HB interval out of range");
+                return;
+            }
+            storage.setHBInterval(value);
+            heartbeatIntervalMs = value;
+            lastHeartbeatTime   = millis(); // reset timer to avoid immediate fire
+            Serial.printf(">>> CONFIG APPLIED: HB interval=%lums\n", (unsigned long)value);
+            ble.send("CONFIG: HB=" + String(value / 1000) + "s");
+            break;
+        }
+        case sc::CONFIG_REBOOT:
+            Serial.println(">>> CONFIG: REBOOT command received");
+            ble.send("CONFIG: REBOOTING...");
+            storage.setLastConfigId(frame.event_id);
+            delay(400);
+            ESP.restart();
+            return; // never reached
+        default:
+            Serial.printf(">>> CONFIG: unknown key 0x%02X — ignored\n", (uint8_t)key);
+            return;
     }
+
+    // Persist config_id so we don't re-apply on relay bounce
+    if (frame.event_id != 0) storage.setLastConfigId(frame.event_id);
 }
 
 void printMenu() {
     Serial.println("\n--- COMMANDS ---");
-    Serial.println("flood | fire | crime | send");
-    Serial.println("gps | relay on/off | uid <id>");
-    Serial.println("sf <7-12> | auto on/off | info | reboot");
+    Serial.println("flood | fire | crime | safe | send");
+    Serial.println("gps | relay on/off | uid <id> | sf <7-12>");
+    Serial.println("auto on/off | info | reboot");
+    Serial.println("setpsk <32hex> | showpsk");
 }
-
-
 
 
 ==================================================
@@ -685,6 +772,152 @@ public:
 
 ==================================================
 FILE: config.h
+==================================================
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <Arduino.h>
+
+#define LOG_LEVEL_DEFAULT LOG_INFO
+
+// =======================================================
+// 1. MASTER HARDWARE SWITCH (Uncomment ONLY ONE)
+// =======================================================
+#define BOARD_ESP32_C3_SUPER_MINI
+// #define BOARD_ESP32_S3_SUPER_MINI
+
+// =======================================================
+// 2. DEVICE ROLES (Uncomment ONLY ONE)
+// =======================================================
+#define ROLE_NODE
+// #define ROLE_REPEATER
+// #define ROLE_GATEWAY
+
+// =======================================================
+// 3. HARDWARE PINS
+// =======================================================
+#if defined(BOARD_ESP32_C3_SUPER_MINI)
+    #define PIN_BUZZER      10 // 2
+    #define PIN_GPS_RX      20
+    #define PIN_GPS_TX      21
+    #define PIN_RGB         9
+    #define PIN_BATTERY     0
+    #define PIN_BTN_FLOOD   3
+    #define PIN_BTN_FIRE    1 
+    #define PIN_BTN_CRIME   2 // 10
+    #define SCK_PIN         4
+    #define MISO_PIN        5
+    #define MOSI_PIN        6
+    #define SS_PIN          7
+    #define RST_PIN         8
+    #define DIO0_PIN        -1
+#elif defined(BOARD_ESP32_S3_SUPER_MINI)
+    #define PIN_BUZZER      9
+    #define PIN_GPS_RX      44
+    #define PIN_GPS_TX      43
+    #define PIN_RGB         48
+    #define PIN_BATTERY     3
+    #define PIN_BTN_FLOOD   1
+    #define PIN_BTN_FIRE    2
+    #define PIN_BTN_CRIME   4
+    #define SCK_PIN         7
+    #define MISO_PIN        5
+    #define MOSI_PIN        6
+    #define SS_PIN          10
+    #define RST_PIN         11
+    #define DIO0_PIN        -1
+#endif
+
+// =======================================================
+// 4. LORA SETTINGS
+// =======================================================
+#define LORA_FREQ       433E6
+#define LORA_SF         11
+#define LORA_BW         125E3
+#define LORA_CR         8
+#define LORA_PREAMBLE   16
+#define LORA_SYNCWORD   0xF3
+#define LORA_TXPOWER    17
+
+// =======================================================
+// 5. PROTOCOL TIMERS
+// =======================================================
+#define MAX_HOP         10
+
+// [M4] Node no longer relays packets — these settings remain for Repeater only
+// Repeater config.h retains its own DUPLICATE_CACHE_SIZE and RELAY delays
+
+#define ACK_TIMEOUT_MS              5000
+#define RETRY_INTERVAL_MS           8000
+#define MAX_RETRIES                 3
+#define FAILED_RETRY_INTERVAL_MS    60000
+
+// =======================================================
+// 6. WATCHDOG & RADIO HEALTH  [M1]
+// =======================================================
+#define WDT_TIMEOUT_S                   10
+#define LORA_HEALTH_CHECK_INTERVAL_MS   30000
+
+// =======================================================
+// 7. UI TIMERS
+// =======================================================
+#define AUTO_MODE_INTERVAL      15000
+#define LED_UPDATE_INTERVAL     2000
+#define BLE_UPDATE_INTERVAL     3000
+#define GPS_VALID_AGE_MS        5000
+
+// =======================================================
+// 8. HEARTBEAT [M5]
+// =======================================================
+// How often to broadcast a FRAME_HEARTBEAT while idle
+#define HEARTBEAT_INTERVAL_MS       300000UL  // 5 minutes
+
+// Gateway marks a node OFFLINE after this much silence
+// Set to 3x interval plus a 3-minute margin for RF variance
+#define NODE_OFFLINE_THRESHOLD_MS   1080000UL // 18 minutes
+
+// How often the gateway checks for offline nodes
+#define NODE_OFFLINE_CHECK_MS       60000UL   // 1 minute
+
+// =======================================================
+// 9. MESSAGE ENUMS
+// =======================================================
+enum MsgType : uint8_t {
+    MSG_EMERGENCY = 0x1A,
+    MSG_HEARTBEAT = 0x2A,
+    MSG_ACK       = 0x0A,
+    MSG_TEST      = 0xFF
+};
+
+enum EmergencyType : uint8_t {
+    EM_NONE  = 0x00,
+    EM_FIRE  = 0x01,
+    EM_FLOOD = 0x02,
+    EM_CRIME = 0x03,
+    EM_SAFE  = 0x04
+};
+
+// =======================================================
+// 9. DEFAULT NODE IDs
+// =======================================================
+#ifdef ROLE_REPEATER
+    #define DEFAULT_NODE_ID "REP01"
+#elif defined(ROLE_GATEWAY)
+    #define DEFAULT_NODE_ID "GTW01"
+#else
+    #if defined(BOARD_ESP32_S3_SUPER_MINI)
+        #define DEFAULT_NODE_ID "S3"
+    #else
+        #define DEFAULT_NODE_ID "FOB01"
+    #endif
+#endif
+
+#endif
+
+
+==================================================
+FILE: configs3.h
 ==================================================
 
 #ifndef CONFIG_H
@@ -781,96 +1014,38 @@ enum EmergencyType : uint8_t {
 
 
 ==================================================
-FILE: configc3.h
+FILE: debug_log.h
 ==================================================
 
-#ifndef CONFIG_H
-#define CONFIG_H
+#ifndef DEBUG_LOG_H
+#define DEBUG_LOG_H
 
 #include <Arduino.h>
 
-// === DEVICE ROLES (Uncomment ONLY one) ===
-#define ROLE_NODE
-// #define ROLE_REPEATER
-// #define ROLE_GATEWAY
-
-// === HARDWARE PINS ===
-#define PIN_BUZZER      2
-#define PIN_GPS_RX      20
-#define PIN_GPS_TX      21
-#define PIN_RGB         9 // change back to pin 0 for esp32 s3
-// Buttons (Used on Node, optional on Repeater for test)
-#define PIN_BTN_FLOOD   3
-#define PIN_BTN_FIRE    1
-#define PIN_BTN_CRIME   10
-
-#define PIN_BATTERY     0   // Safe ADC1 Pin for voltage reading
-
-// LoRa SPI
-#define SCK_PIN         4
-#define MISO_PIN        5
-#define MOSI_PIN        6
-#define SS_PIN          7
-#define RST_PIN         8
-#define DIO0_PIN        -1
-
-// === LORA SETTINGS ===
-#define LORA_FREQ       433E6
-#define LORA_SF         11
-#define LORA_BW         125E3
-#define LORA_CR         8
-#define LORA_PREAMBLE   16
-#define LORA_SYNCWORD   0xF3
-#define LORA_TXPOWER    17  // Boosted to 20dBm for Repeater/Gateway
-
-// === PROTOCOL ===
-#define MAX_HOP         10
-
-// Adjust cache based on role
-#ifdef ROLE_REPEATER
-    #define DUPLICATE_CACHE_SIZE 60 // Remember more packets
-    #define RELAY_MIN_DELAY 200     // Faster relay
-    #define RELAY_MAX_DELAY 800
-#else
-    #define DUPLICATE_CACHE_SIZE 20
-    #define RELAY_MIN_DELAY 500
-    #define RELAY_MAX_DELAY 1500
-#endif
-
-#define ACK_TIMEOUT_MS  5000
-#define RETRY_INTERVAL_MS 8000
-#define MAX_RETRIES     3
-
-// === TIMING ===
-#define AUTO_MODE_INTERVAL  15000
-#define LED_UPDATE_INTERVAL 2000
-#define BLE_UPDATE_INTERVAL 3000  // ← ADD THIS LINE
-#define GPS_VALID_AGE_MS    5000  // ← ADD THIS LINE
-
-// === MESSAGE TYPES ===
-enum MsgType : uint8_t {
-    MSG_EMERGENCY = 0x01,
-    MSG_HEARTBEAT = 0x02,
-    MSG_ACK       = 0x0A,
-    MSG_TEST      = 0xFF
+enum LogLevel : uint8_t {
+    LOG_QUIET = 0,
+    LOG_INFO  = 1,
+    LOG_DEBUG = 2
 };
 
-enum EmergencyType : uint8_t {
-    EM_NONE  = 0x00,
-    EM_FIRE  = 0x01,
-    EM_FLOOD = 0x02,
-    EM_CRIME = 0x03,
-    EM_SAFE  = 0x04
+#ifndef LOG_LEVEL_DEFAULT
+#define LOG_LEVEL_DEFAULT LOG_INFO
+#endif
+
+class DebugLog {
+public:
+    static void init(uint8_t level = LOG_LEVEL_DEFAULT);
+    static void setLevel(uint8_t level);
+    static uint8_t getLevel();
+
+    static bool quiet();
+    static bool info();
+    static bool debug();
 };
 
-// === DEFAULTS ===
-#ifdef ROLE_REPEATER
-    #define DEFAULT_NODE_ID "REP01"
-#elif defined(ROLE_GATEWAY)
-    #define DEFAULT_NODE_ID "GTW01"
-#else
-    #define DEFAULT_NODE_ID "FOB01"
-#endif
+#define LOGQ(...) do { if (DebugLog::quiet()) { Serial.printf(__VA_ARGS__); } } while (0)
+#define LOGI(...) do { if (DebugLog::info())  { Serial.printf(__VA_ARGS__); } } while (0)
+#define LOGD(...) do { if (DebugLog::debug()) { Serial.printf(__VA_ARGS__); } } while (0)
 
 #endif
 
@@ -884,50 +1059,74 @@ FILE: emergency.h
 
 #include <Arduino.h>
 #include "config.h"
-#include "packet.h"
-#include "ble_terminal.h" // Include this if not already in emergency.h
+#include "safechain_protocol.h"
+#include "ble_terminal.h"
 
-enum EmergencyState {
-    EM_STATE_IDLE,
-    EM_STATE_SENDING,
-    EM_STATE_WAITING_ACK,
-    EM_STATE_CONFIRMED,
-    EM_STATE_FAILED
+class Storage;
+
+enum EmergencyState : uint8_t {
+    EM_STATE_IDLE       = 0,
+    EM_STATE_PENDING_TX = 1,
+    EM_STATE_WAITING_ACK= 2,
+    EM_STATE_CONFIRMED  = 3,
+    EM_STATE_FAILED     = 4
 };
 
 class EmergencyManager {
 private:
-    SafeChainPacket pendingPacket;
+    sc::SafeChainFrameV1 pendingFrame;
     EmergencyState state;
     uint8_t retryCount;
-    unsigned long lastSendTime;
+
+    // [M0-1] Overflow-safe timer
+    unsigned long actionScheduledAt;
+    uint32_t      actionDelayMs;
+
+    unsigned long stateSince;
+
     const char* nodeID;
-    
+    Storage*    storage;
+
+    uint32_t      currentEventId;
+    EmergencyType currentEmergencyType;
+    bool          pendingFrameValid;
+
+    // [M3] PSK cache — loaded from storage once on init, held in RAM
+    uint8_t psk[sc::PSK_LEN];
+
 public:
     EmergencyManager();
-    
-    void init(const char* id);
-    
-    // Trigger emergency send
+
+    void init(const char* id, Storage* storageRef);
+
+    // [M3] reloadPSK() — call after setpsk command to pick up new key
+    void reloadPSK();
+
     void trigger(EmergencyType type, float lat, float lon, uint8_t batt);
-    
-    // Update state machine (call in loop)
     void update();
-    
-    // Handle incoming ACK
-    void handleACK(const SafeChainPacket &ack);
-    
-    // Check if waiting for ACK
-    bool isWaiting() const { return state == EM_STATE_WAITING_ACK; }
-    
-    // Get current state
-    EmergencyState getState() const { return state; }
-    
+    void handleACK(const sc::SafeChainFrameV1 &ack);
+    bool resumePending();
+
+    bool           isWaiting()       const { return state == EM_STATE_WAITING_ACK; }
+    EmergencyState getState()        const { return state; }
+    bool           hasPendingEvent() const { return pendingFrameValid; }
+
 private:
-    void transmit();
-    void retry();
-    void fail();
-    void confirm();
+    void setState(EmergencyState newState);
+    void scheduleAction(uint32_t delayMs);
+    bool isActionDue() const;
+
+    void transmitNow();
+    void scheduleRetry();
+    void markFailed();
+    void markConfirmed();
+
+    bool saveJournal(uint8_t journalState);
+    void clearJournal();
+
+    sc::EventType toProtocolEventType(EmergencyType type) const;
+    EmergencyType fromProtocolEventType(uint8_t type) const;
+    int32_t       toFixedPointE7(float value) const;
 };
 
 #endif
@@ -1092,108 +1291,178 @@ enum EmergencyType : uint8_t {
 
 
 ==================================================
-FILE: packet.h
+FILE: safechain_protocol.h
 ==================================================
 
-#ifndef PACKET_H
-#define PACKET_H
+#ifndef SAFECHAIN_PROTOCOL_H
+#define SAFECHAIN_PROTOCOL_H
 
 #include <Arduino.h>
-#include "config.h"
 
-struct __attribute__((packed)) SafeChainPacket {
-    char     srcID[6];      // "FOB01" + null terminator
-    uint8_t  msgType;       // MsgType enum
-    uint16_t seqNum;        // Sequence counter
-    float    latitude;      // Raw float (4 bytes)
-    float    longitude;     // Raw float (4 bytes)
-    uint8_t  hopCount;      // Current hop
-    uint8_t  maxHop;        // Limit (always 3)
-    uint8_t  battery;       // 0-100%
-    int16_t  rssi;  
-    uint16_t crc;           // CRC-16-CCITT
+// ============================================================
+// M3 — Security Baseline
+//
+// SafeChainFrameV1 now carries a 4-byte auth_tag (HMAC-SHA256
+// truncated to 32 bits) before the existing crc16 field.
+// Frame size grows from 41 → 45 bytes.
+//
+// HMAC covers only the fields that are STABLE across hops:
+//   protocol_version, frame_type, event_type, flags,
+//   origin_id, event_id, attempt, max_hops,
+//   event_time_ms, lat_e7, lon_e7, battery_pct
+//
+// Mutable-per-hop fields (sender_id, hop_count, last_rssi_dbm)
+// are NOT authenticated — they are protected only by crc16.
+//
+// This means the repeater can relay without recomputing auth_tag.
+// Only the originating node sets auth_tag; all receivers verify it.
+//
+// Key: 16-byte PSK stored in NVS. Default dev key is
+// "SafeChain_Dev01" (all devices use this until provisioned).
+// Provision via Serial: setpsk <32 hex chars>
+// ============================================================
+
+namespace sc {
+
+static constexpr uint8_t  PROTOCOL_VERSION = 1;
+static constexpr uint8_t  DEVICE_ID_LEN    = 6;
+static constexpr uint8_t  MAX_HOPS_DEFAULT = 10;
+static constexpr uint8_t  PSK_LEN          = 16;  // [M3]
+
+// Default development PSK — change in production via setpsk command
+static const char PSK_DEFAULT[PSK_LEN + 1] = "SafeChain_Dev01"; // 15 chars + null
+
+// Transport-level frame meaning
+enum FrameType : uint8_t {
+    FRAME_EVENT     = 0x01,
+    FRAME_ACK       = 0x02,
+    FRAME_HEARTBEAT = 0x03,
+    FRAME_STATUS    = 0x04,
+    FRAME_CONFIG    = 0x05
 };
 
-class PacketBuilder {
+// Emergency/business meaning
+enum EventType : uint8_t {
+    EVENT_NONE  = 0x00,
+    EVENT_FIRE  = 0x01,
+    EVENT_FLOOD = 0x02,
+    EVENT_CRIME = 0x03,
+    EVENT_SAFE  = 0x04,
+    EVENT_TEST  = 0xFF
+};
+
+enum FrameFlags : uint8_t {
+    FLAG_REQUIRE_ACK    = 1 << 0,
+    FLAG_LOW_BATTERY    = 1 << 1,
+    FLAG_GPS_VALID      = 1 << 2,
+    FLAG_HOST_COMMITTED = 1 << 3,
+    FLAG_AUTH_PRESENT   = 1 << 4   // [M3] set when auth_tag is valid
+};
+
+// [M6] Configuration keys — carried in event_type field of FRAME_CONFIG
+// config_value is carried in event_time_ms (uint32).
+// origin_id = target node ID, or "ALL" for broadcast.
+enum ConfigKey : uint8_t {
+    CONFIG_SF           = 0x01,  // Spreading factor (7-12)
+    CONFIG_TX_POWER     = 0x02,  // TX power in dBm (2-20)
+    CONFIG_HB_INTERVAL  = 0x03,  // Heartbeat interval in ms
+    CONFIG_REBOOT       = 0x04   // Trigger soft reboot (value ignored)
+};
+
+// Broadcast target — origin_id value meaning "apply to all nodes"
+static const char CONFIG_TARGET_ALL[DEVICE_ID_LEN] = "ALL";
+
+struct __attribute__((packed)) SafeChainFrameV1 {
+    uint8_t  protocol_version;
+    uint8_t  frame_type;
+    uint8_t  event_type;
+    uint8_t  flags;
+
+    char     origin_id[DEVICE_ID_LEN];
+    char     sender_id[DEVICE_ID_LEN];
+
+    uint32_t event_id;
+    uint16_t attempt;
+    uint8_t  hop_count;
+    uint8_t  max_hops;
+
+    uint32_t event_time_ms;
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+
+    uint8_t  battery_pct;
+    int16_t  last_rssi_dbm;
+
+    // [M3] Authentication tag — HMAC-SHA256 truncated to 32 bits.
+    // Covers stable inner payload (see computeHMAC32).
+    // Must be computed before crc16.
+    uint32_t auth_tag;
+
+    // Wire integrity over entire frame above (including auth_tag)
+    uint16_t crc16;
+};
+
+struct DedupKey {
+    char     origin_id[DEVICE_ID_LEN];
+    uint32_t event_id;
+    uint8_t  frame_type;
+};
+
+class Protocol {
 public:
-    static uint16_t seqCounter;
-    
-    // Build new packet
-    static void build(SafeChainPacket &pkt, 
-                      const char* srcID,
-                      MsgType type,
-                      EmergencyType emType,
-                      float lat, float lon,
-                      uint8_t batt);
-    
-    // Build ACK response
-    static void buildACK(SafeChainPacket &pkt,
-                         const char* srcID,
-                         uint16_t ackSeqNum);
-    
-    // CRC calculation
-    static uint16_t calcCRC16(const uint8_t *data, uint16_t length);
-    
-    // Validation
-    static bool validate(const SafeChainPacket &pkt);
-    
-    // Relay preparation
-    static bool prepareRelay(SafeChainPacket &pkt);
-    
-    // Debug print
-    static void print(const SafeChainPacket &pkt);
+    static uint16_t calcCRC16(const uint8_t* data, size_t len);
+
+    // [M3] Compute 4-byte truncated HMAC-SHA256 over the stable inner payload
+    static uint32_t computeHMAC32(const uint8_t* psk, size_t pskLen,
+                                   const SafeChainFrameV1& frame);
+
+    static void initFrame(SafeChainFrameV1& frame);
+
+    // [M3] finalizeFrame now requires PSK to compute auth_tag
+    static void finalizeFrame(SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen);
+
+    // [M3] validateFrame checks both crc16 and auth_tag
+    static bool validateFrame(const SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen);
+
+    static void buildEventFrame(SafeChainFrameV1& frame,
+                                const char* originId,
+                                const char* senderId,
+                                uint32_t eventId,
+                                EventType eventType,
+                                uint16_t attempt,
+                                uint32_t eventTimeMs,
+                                int32_t latE7,
+                                int32_t lonE7,
+                                uint8_t batteryPct,
+                                bool gpsValid,
+                                bool lowBattery,
+                                const uint8_t* psk, size_t pskLen,
+                                uint8_t maxHops = MAX_HOPS_DEFAULT);
+
+    static void buildAckFrame(SafeChainFrameV1& frame,
+                              const char* gatewayOrRepeaterId,
+                              const char* originId,
+                              uint32_t eventId,
+                              EventType eventType,
+                              const uint8_t* psk, size_t pskLen,
+                              uint8_t maxHops = MAX_HOPS_DEFAULT);
+
+    // prepareRelay only updates sender_id/hop_count (not auth_tag — HMAC stable)
+    // but must recompute crc16 since sender_id and hop_count changed
+    static bool prepareRelay(SafeChainFrameV1& frame, const char* newSenderId,
+                              const uint8_t* psk, size_t pskLen);
+
+    static bool makeDedupKey(const SafeChainFrameV1& frame, DedupKey& out);
+
+    static bool isEmergencyEvent(const SafeChainFrameV1& frame);
+
+    static const char* frameTypeName(uint8_t frameType);
+    static const char* eventTypeName(uint8_t eventType);
 };
 
-#endif
-
-
-==================================================
-FILE: router.h
-==================================================
-
-#ifndef ROUTER_H
-#define ROUTER_H
-
-#include <Arduino.h>
-#include "config.h"
-#include "packet.h"
-
-class Router {
-private:
-    uint16_t seenCache[DUPLICATE_CACHE_SIZE];
-    uint8_t cacheIndex;
-    String myNodeID;
-    bool relayEnabled;
-    
-    // Pending relay state
-    SafeChainPacket pendingPacket;
-    bool isPending;
-    unsigned long relayTriggerTime;
-    
-public:
-    Router();
-    
-    void init(const char* nodeID, bool enableRelay);
-    void setRelayEnabled(bool enabled);
-    bool getRelayEnabled() const { return relayEnabled; }
-    
-    // Check if packet should be relayed
-    bool shouldRelay(const SafeChainPacket &pkt);
-    
-    // Queue packet for relay
-    void queueRelay(const SafeChainPacket &pkt);
-    
-    // Process pending relay (call in loop)
-    void update();
-    
-    // Cancel pending relay (for emergency override)
-    void cancelRelay();
-    
-private:
-    bool isDuplicate(uint16_t seqNum);
-    void markSeen(uint16_t seqNum);
-    bool isOwnPacket(const SafeChainPacket &pkt);
-};
+} // namespace sc
 
 #endif
 
@@ -1208,27 +1477,66 @@ FILE: storage.h
 #include <Arduino.h>
 #include <Preferences.h>
 #include "config.h"
+#include "safechain_protocol.h"
+
+struct NodeEventRecord {
+    uint32_t magic;
+    uint32_t event_id;
+    uint8_t  event_type;
+    uint16_t attempt;
+    uint8_t  state;       // 1=pending_ack, 2=acked, 3=cleared
+    uint8_t  battery_pct;
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+    uint32_t created_ms;
+    uint32_t updated_ms;
+    uint16_t crc16;
+};
 
 class Storage {
 private:
     Preferences prefs;
-    
+
 public:
     Storage();
-    
     void init();
-    
-    // Node ID
-    String getNodeID();
-    void setNodeID(const String &id);
-    
-    // Relay mode
-    bool getRelayEnabled();
-    void setRelayEnabled(bool enabled);
-    
-    // Spreading Factor
+
+    String  getNodeID();
+    void    setNodeID(const String &id);
+
+    bool    getRelayEnabled();
+    void    setRelayEnabled(bool enabled);
+
     uint8_t getSpreadingFactor();
-    void setSpreadingFactor(uint8_t sf);
+    void    setSpreadingFactor(uint8_t sf);
+
+    uint32_t getEventCounter();
+    uint32_t nextEventCounter();
+    void     setEventCounter(uint32_t value);
+
+    bool savePendingEvent(const NodeEventRecord &record);
+    bool loadPendingEvent(NodeEventRecord &record);
+    void clearPendingEvent();
+    bool hasPendingEvent();
+
+    // [M6] TX power — persisted so it survives reboot after OTA config
+    uint8_t getTxPower();
+    void    setTxPower(uint8_t dbm);
+
+    // [M6] Heartbeat interval — persisted so it survives reboot after OTA config
+    uint32_t getHBInterval();
+    void     setHBInterval(uint32_t ms);
+
+    // [M6] Config dedup — last applied config event_id, prevents replay
+    uint32_t getLastConfigId();
+    void     setLastConfigId(uint32_t id);
+
+    // [M3] PSK storage — 16-byte pre-shared key for HMAC authentication
+    // Default: sc::PSK_DEFAULT ("SafeChain_Dev01")
+    // Provision via: setpsk <32 hex chars>
+    void getPSK(uint8_t* out, size_t len);
+    void setPSK(const uint8_t* key, size_t len);
+    bool hasPSK(); // returns true if a custom key has been provisioned
 };
 
 #endif
@@ -1342,7 +1650,10 @@ void BLETerminal::setCommandCallback(void (*cb)(String)) {
 void BLETerminal::handleConnect() {
     connected = true;
     Serial.println("\n>>> BLE: Connected");
-    tone(PIN_BUZZER, 4000, 100);
+    ledcWriteTone(PIN_BUZZER, 4000);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(100);
+    ledcWrite(PIN_BUZZER, 0);
 }
 
 void BLETerminal::handleDisconnect() {
@@ -1368,191 +1679,350 @@ void BLETerminal::handleData(String data) {
 
 
 ==================================================
+FILE: debug_log.cpp
+==================================================
+
+#include "debug_log.h"
+
+static uint8_t g_logLevel = LOG_LEVEL_DEFAULT;
+
+void DebugLog::init(uint8_t level) {
+    g_logLevel = level;
+}
+
+void DebugLog::setLevel(uint8_t level) {
+    g_logLevel = level;
+}
+
+uint8_t DebugLog::getLevel() {
+    return g_logLevel;
+}
+
+bool DebugLog::quiet() {
+    return g_logLevel >= LOG_QUIET;
+}
+
+bool DebugLog::info() {
+    return g_logLevel >= LOG_INFO;
+}
+
+bool DebugLog::debug() {
+    return g_logLevel >= LOG_DEBUG;
+}
+
+
+==================================================
 FILE: emergency.cpp
 ==================================================
 
 #include "emergency.h"
+#include "storage.h"
 #include <LoRa.h>
 #include <OneButton.h>
+#include <string.h>
 
-// 👇 Bring the buttons over from the main file!
 extern OneButton btnFlood;
 extern OneButton btnFire;
 extern OneButton btnCrime;
+extern BLETerminal ble;
 
-extern void flashRGB(int r, int g, int b, int times);  // Forward declare
-extern BLETerminal ble;                                // Forward declare BLE for terminal messages
+static constexpr uint8_t JOURNAL_PENDING_ACK = 1;
+static constexpr uint8_t JOURNAL_ACKED       = 2;
+static constexpr uint8_t JOURNAL_CLEARED     = 3;
 
-EmergencyManager::EmergencyManager() 
-    : state(EM_STATE_IDLE), retryCount(0), lastSendTime(0) {}
-
-void EmergencyManager::init(const char* id) {
-    nodeID = id;
+EmergencyManager::EmergencyManager()
+    : state(EM_STATE_IDLE), retryCount(0),
+      actionScheduledAt(0), actionDelayMs(0), stateSince(0),
+      nodeID(nullptr), storage(nullptr),
+      currentEventId(0), currentEmergencyType(EM_NONE),
+      pendingFrameValid(false) {
+    memset(&pendingFrame, 0, sizeof(pendingFrame));
+    memset(psk, 0, sizeof(psk));
 }
 
-void EmergencyManager::trigger(EmergencyType type, float lat, float lon, uint8_t batt) {
-    PacketBuilder::build(pendingPacket, nodeID, MSG_EMERGENCY, 
-                         type, lat, lon, batt);
-    
-    // If it is a SAFE signal, "Fire and Forget"!
-    if (type == EM_SAFE) {
-        Serial.println("📡 SENDING: Safe Signal Broadcast");
-        
-        // Rapid-fire 3 times to guarantee delivery without waiting for ACKs
-        for(int i = 0; i < 3; i++) {
-            LoRa.beginPacket();
-            LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-            LoRa.endPacket();
-            delay(100); 
-        }
-        LoRa.receive();
-        
-        // INSTANTLY kill the emergency loop and silence the Node
-        state = EM_STATE_IDLE; 
-        
-    } else {
-        // Normal Emergency (Wait for ACK and run retry loops)
-        state = EM_STATE_SENDING;
-        retryCount = 0;
-        transmit();
+void EmergencyManager::init(const char* id, Storage* storageRef) {
+    nodeID  = id;
+    storage = storageRef;
+    reloadPSK();
+    setState(EM_STATE_IDLE);
+}
+
+// [M3] Load PSK from NVS (or default if not provisioned)
+void EmergencyManager::reloadPSK() {
+    if (storage) {
+        storage->getPSK(psk, sc::PSK_LEN);
+        bool custom = storage->hasPSK();
+        Serial.printf(">>> PSK loaded (%s)\n", custom ? "provisioned" : "dev default");
     }
 }
 
-void EmergencyManager::transmit() {
-    String statusMsg = "📡 SENDING: Seq " + String(pendingPacket.seqNum);
-    Serial.println(statusMsg);
-    ble.send(statusMsg);
-    
-    // 1. ALARMS FIRST (Isolate the power draw)
-    tone(PIN_BUZZER, 4000, 100); 
-    delay(100); // Let the buzzer completely finish
-    
-    // Use a low-power color (Dim Cyan) instead of maximum-power White!
-    flashRGB(0, 50, 50, 2); 
-    
-    // 2. TRANSMIT SECOND (Now 100% of the battery power can go to the LoRa antenna)
+void EmergencyManager::setState(EmergencyState newState) {
+    state      = newState;
+    stateSince = millis();
+}
+
+void EmergencyManager::scheduleAction(uint32_t delayMs) {
+    actionScheduledAt = millis();
+    actionDelayMs     = delayMs;
+}
+
+bool EmergencyManager::isActionDue() const {
+    return (millis() - actionScheduledAt) >= actionDelayMs;
+}
+
+sc::EventType EmergencyManager::toProtocolEventType(EmergencyType type) const {
+    switch (type) {
+        case EM_FIRE:  return sc::EVENT_FIRE;
+        case EM_FLOOD: return sc::EVENT_FLOOD;
+        case EM_CRIME: return sc::EVENT_CRIME;
+        case EM_SAFE:  return sc::EVENT_SAFE;
+        default:       return sc::EVENT_NONE;
+    }
+}
+
+EmergencyType EmergencyManager::fromProtocolEventType(uint8_t type) const {
+    switch (type) {
+        case sc::EVENT_FIRE:  return EM_FIRE;
+        case sc::EVENT_FLOOD: return EM_FLOOD;
+        case sc::EVENT_CRIME: return EM_CRIME;
+        case sc::EVENT_SAFE:  return EM_SAFE;
+        default:              return EM_NONE;
+    }
+}
+
+int32_t EmergencyManager::toFixedPointE7(float value) const {
+    return (int32_t)(value * 10000000.0f);
+}
+
+bool EmergencyManager::saveJournal(uint8_t journalState) {
+    if (!storage || !pendingFrameValid) return false;
+    NodeEventRecord rec{};
+    rec.event_id    = pendingFrame.event_id;
+    rec.event_type  = pendingFrame.event_type;
+    rec.attempt     = pendingFrame.attempt;
+    rec.state       = journalState;
+    rec.battery_pct = pendingFrame.battery_pct;
+    rec.lat_e7      = pendingFrame.lat_e7;
+    rec.lon_e7      = pendingFrame.lon_e7;
+    rec.created_ms  = pendingFrame.event_time_ms;
+    rec.updated_ms  = millis();
+    bool ok = storage->savePendingEvent(rec);
+    if (!ok) Serial.println(">>> ERROR: journal save failed");
+    return ok;
+}
+
+void EmergencyManager::clearJournal() {
+    if (storage) storage->clearPendingEvent();
+}
+
+// ---------------------------------------------------------------------------
+// trigger — [M3] passes PSK to buildEventFrame
+// ---------------------------------------------------------------------------
+void EmergencyManager::trigger(EmergencyType type, float lat, float lon, uint8_t batt) {
+    if (!storage || !nodeID) {
+        Serial.println(">>> ERROR: EmergencyManager not initialized");
+        return;
+    }
+
+    currentEmergencyType = type;
+    currentEventId       = storage->nextEventCounter();
+    retryCount           = 0;
+
+    bool gpsValid   = !(lat == 0.0f && lon == 0.0f);
+    bool lowBattery = (batt <= 15);
+
+    // [M3] PSK passed to buildEventFrame — auth_tag computed inside
+    sc::Protocol::buildEventFrame(
+        pendingFrame,
+        nodeID, nodeID,
+        currentEventId,
+        toProtocolEventType(type),
+        0,
+        millis(),
+        toFixedPointE7(lat),
+        toFixedPointE7(lon),
+        batt, gpsValid, lowBattery,
+        psk, sc::PSK_LEN
+    );
+
+    pendingFrameValid = true;
+    if (!saveJournal(JOURNAL_PENDING_ACK))
+        Serial.println(">>> WARNING: event created but journal save failed");
+
+    Serial.printf("EVENT CREATED: ID %lu TYPE %s (auth_tag=0x%08lX)\n",
+        (unsigned long)pendingFrame.event_id,
+        sc::Protocol::eventTypeName(pendingFrame.event_type),
+        (unsigned long)pendingFrame.auth_tag);
+    ble.send("EVENT CREATED");
+
+    setState(EM_STATE_PENDING_TX);
+    scheduleAction(0);
+}
+
+// ---------------------------------------------------------------------------
+// transmitNow — [M3] re-finalizes with PSK before each TX
+// ---------------------------------------------------------------------------
+void EmergencyManager::transmitNow() {
+    if (!pendingFrameValid) return;
+
+    pendingFrame.attempt   = retryCount;
+    pendingFrame.hop_count = 0;
+    strncpy(pendingFrame.sender_id, nodeID, sc::DEVICE_ID_LEN - 1);
+    pendingFrame.sender_id[sc::DEVICE_ID_LEN - 1] = '\0';
+
+    // [M3] Re-finalize: recompute auth_tag and crc16 (attempt/sender may have changed)
+    sc::Protocol::finalizeFrame(pendingFrame, psk, sc::PSK_LEN);
+    saveJournal(JOURNAL_PENDING_ACK);
+
+    Serial.printf("TX: EventID %lu Attempt %u auth=0x%08lX\n",
+        (unsigned long)pendingFrame.event_id, pendingFrame.attempt,
+        (unsigned long)pendingFrame.auth_tag);
+    ble.send("SENDING EVENT");
+
+    ledcWriteTone(PIN_BUZZER, 4000);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(100);
+    ledcWrite(PIN_BUZZER, 0);
+
     LoRa.beginPacket();
-    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    LoRa.endPacket(); // Blocking send
-    
-    LoRa.receive(); // Turn ears back on
-    
-    state = EM_STATE_WAITING_ACK;
-    lastSendTime = millis();
+    LoRa.write((uint8_t*)&pendingFrame, sizeof(sc::SafeChainFrameV1));
+    LoRa.endPacket();
+    LoRa.receive();
 
+    setState(EM_STATE_WAITING_ACK);
+    scheduleAction(ACK_TIMEOUT_MS);
+}
 
-    // String statusMsg = "📡 SENDING: Seq " + String(pendingPacket.seqNum);
-    // Serial.println(statusMsg);
-    // ble.send(statusMsg);
-    
-    // // 👇 LOUD, PIERCING BEEP FOR SENDING (High 4000Hz tone)
-    // tone(PIN_BUZZER, 4000, 200); 
-    
-    // flashRGB(255, 255, 255, 2);  // White flash
-    
-    // LoRa.beginPacket();
-    // LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    // LoRa.endPacket();  // Blocking send
-    
-    // LoRa.receive();    // Turn ears back on to listen for ACK
-    
-    // state = EM_STATE_WAITING_ACK;
-    // lastSendTime = millis();
-    
+void EmergencyManager::scheduleRetry() {
+    if (!pendingFrameValid) return;
+    if (retryCount >= MAX_RETRIES) { markFailed(); return; }
+
+    retryCount++;
+    uint32_t minD, maxD;
+    switch (retryCount) {
+        case 1: minD=600;  maxD=900;   break;
+        case 2: minD=1800; maxD=2400;  break;
+        case 3: minD=4000; maxD=5000;  break;
+        default:minD=8000; maxD=10000; break;
+    }
+    uint32_t backoff = random(minD, maxD + 1);
+    Serial.printf("RETRY %u/%u EventID %lu after %lums\n",
+        retryCount, MAX_RETRIES,
+        (unsigned long)pendingFrame.event_id, (unsigned long)backoff);
+    ble.send("RETRYING");
+    ledcWriteTone(PIN_BUZZER, 800);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(50);
+    ledcWrite(PIN_BUZZER, 0);
+
+    pendingFrame.attempt       = retryCount;
+    pendingFrame.event_time_ms = millis();
+    sc::Protocol::finalizeFrame(pendingFrame, psk, sc::PSK_LEN);
+    saveJournal(JOURNAL_PENDING_ACK);
+
+    setState(EM_STATE_PENDING_TX);
+    scheduleAction(backoff);
+}
+
+void EmergencyManager::markFailed() {
+    Serial.println(">>> FAILED - No ACK after all retries");
+    ble.send("FAILED - Auto-retry in 60s.");
+    ledcWriteTone(PIN_BUZZER, 500);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(1000);
+    ledcWrite(PIN_BUZZER, 0);
+    saveJournal(JOURNAL_PENDING_ACK);
+    setState(EM_STATE_FAILED);
+    scheduleAction(FAILED_RETRY_INTERVAL_MS);
+}
+
+void EmergencyManager::markConfirmed() {
+    Serial.println(">>> ACK RECEIVED - SUCCESS!");
+    ble.send("ALERT CONFIRMED - Help is on the way!");
+    ledcWriteTone(PIN_BUZZER, 2500);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(150);
+    ledcWrite(PIN_BUZZER, 0);
+    saveJournal(JOURNAL_ACKED);
+    clearJournal();
+    pendingFrameValid    = false;
+    currentEventId       = 0;
+    currentEmergencyType = EM_NONE;
+    retryCount           = 0;
+    setState(EM_STATE_CONFIRMED);
+    scheduleAction(1000);
 }
 
 void EmergencyManager::update() {
-    if (state != EM_STATE_WAITING_ACK) return;
-    
-    // Check timeout
-    if (millis() - lastSendTime > ACK_TIMEOUT_MS) {
-        retry();
-    }
-}
+    btnFlood.tick();
+    btnFire.tick();
+    btnCrime.tick();
 
-void EmergencyManager::retry() {
-    if (retryCount < MAX_RETRIES) {
-        retryCount++;
-        
-        // Exponential backoff with jitter
-        uint32_t minDelay = 4000 * (1 << (retryCount - 1));
-        uint32_t maxDelay = minDelay * 2;
-        uint32_t backoff = random(minDelay, maxDelay);
-        
-        String retryMsg = "⚠️ RETRY " + String(retryCount) + "/" + String(MAX_RETRIES) + 
-                          " (Wait: " + String(backoff / 1000) + "s)";
-        Serial.println(retryMsg);
-        ble.send(retryMsg);
-        
-        flashRGB(255, 100, 0, 2); // Orange flash
-        
-        // 👇 THE NEW HEARTBEAT TIMER LOOP
-        unsigned long startWait = millis();
-        while (millis() - startWait < backoff) {
-            // "Ba-bum" heartbeat sound (Low 800Hz tone)
-            tone(PIN_BUZZER, 800, 50);
-            delay(100);
-            
-            // Check if time is up before the second beat
-            if (millis() - startWait >= backoff) break;
-            tone(PIN_BUZZER, 800, 50); 
-            
-            // Gap between heartbeats (approx 850ms)
-            unsigned long gapStart = millis();
-            while (millis() - gapStart < 850) {
-                
-                // 👇 FIX 2: Keep the buttons alive while waiting!
-                btnFlood.tick();
-                btnFire.tick();
-                btnCrime.tick();
-                
-                // If the user double-clicked SAFE, triggerSafe() instantly sets 
-                // the state to IDLE. If we see IDLE, abort the retry immediately!
-                if (state == EM_STATE_IDLE) return; 
-
-                if (millis() - startWait >= backoff) break;
-                delay(10);
+    switch (state) {
+        case EM_STATE_IDLE: break;
+        case EM_STATE_PENDING_TX:
+            if (isActionDue()) transmitNow();
+            break;
+        case EM_STATE_WAITING_ACK:
+            if (isActionDue()) scheduleRetry();
+            break;
+        case EM_STATE_CONFIRMED:
+            if (isActionDue()) setState(EM_STATE_IDLE);
+            break;
+        case EM_STATE_FAILED:
+            if (isActionDue() && pendingFrameValid) {
+                Serial.println(">>> FAILED RECOVERY: re-attempting");
+                ble.send("Auto-retrying failed emergency event");
+                retryCount = 0;
+                setState(EM_STATE_PENDING_TX);
+                scheduleAction(0);
             }
-        }
-        
-        // Final safety catch just in case it was pressed at the last millisecond
-        if (state == EM_STATE_IDLE) return;
-        
-        // Generate new sequence number
-        pendingPacket.seqNum = PacketBuilder::seqCounter++;
-        pendingPacket.crc = PacketBuilder::calcCRC16((uint8_t*)&pendingPacket, sizeof(SafeChainPacket) - 2);
-        
-        transmit();
-    } else {
-        fail();
+            break;
+        default: break;
     }
 }
 
-void EmergencyManager::fail() {
-    Serial.println(">>> FAILED - No ACK after retries");
-    // Send failure to the Bluetooth Terminal
-    ble.send("❌ FAILED - No network acknowledgment received.");
-    flashRGB(255, 0, 0, 5);  // Red
-    // Sad "Failed" Low-Beep (from our previous buzzer upgrade)
-    tone(PIN_BUZZER, 500, 1000);    
-    state = EM_STATE_FAILED;
-}
-
-void EmergencyManager::confirm() {
-    Serial.println(">>> ACK RECEIVED - SUCCESS!");
-    // Send success to the Bluetooth Terminal
-    ble.send("✅ ALERT CONFIRMED - Help is on the way!");
-    flashRGB(0, 255, 0, 3);  // Green
-    // Happy "Success" Double-Beep (from our previous buzzer upgrade)
-    tone(PIN_BUZZER, 2500, 150); delay(200);
-    state = EM_STATE_CONFIRMED;
-}
-
-void EmergencyManager::handleACK(const SafeChainPacket &ack) {
+// ---------------------------------------------------------------------------
+// handleACK — [M3] validateFrame checks HMAC too
+// ---------------------------------------------------------------------------
+void EmergencyManager::handleACK(const sc::SafeChainFrameV1 &ack) {
     if (state != EM_STATE_WAITING_ACK) return;
-    if (ack.seqNum != pendingPacket.seqNum) return;
-    
-    confirm();
+    if (!pendingFrameValid) return;
+    if (!sc::Protocol::validateFrame(ack, psk, sc::PSK_LEN)) return;
+    if (ack.frame_type != sc::FRAME_ACK) return;
+    if (strncmp(ack.origin_id, nodeID, sc::DEVICE_ID_LEN) != 0) return;
+    if (ack.event_id != pendingFrame.event_id) return;
+    markConfirmed();
+}
+
+bool EmergencyManager::resumePending() {
+    if (!storage || !nodeID) return false;
+    NodeEventRecord rec{};
+    if (!storage->loadPendingEvent(rec)) return false;
+    if (rec.state != JOURNAL_PENDING_ACK) return false;
+
+    currentEventId       = rec.event_id;
+    currentEmergencyType = fromProtocolEventType(rec.event_type);
+    retryCount           = rec.attempt;
+    bool gpsValid   = !(rec.lat_e7 == 0 && rec.lon_e7 == 0);
+    bool lowBattery = (rec.battery_pct <= 15);
+
+    sc::Protocol::buildEventFrame(
+        pendingFrame, nodeID, nodeID,
+        rec.event_id, static_cast<sc::EventType>(rec.event_type),
+        rec.attempt, rec.created_ms,
+        rec.lat_e7, rec.lon_e7, rec.battery_pct,
+        gpsValid, lowBattery,
+        psk, sc::PSK_LEN
+    );
+
+    pendingFrameValid = true;
+    Serial.printf(">>> RESUMING PENDING EVENT: ID=%lu attempt=%u\n",
+        (unsigned long)pendingFrame.event_id, pendingFrame.attempt);
+    ble.send("Resuming pending emergency event after reboot");
+    setState(EM_STATE_PENDING_TX);
+    scheduleAction(500);
+    return true;
 }
 
 
@@ -1667,168 +2137,267 @@ void LEDManager::off() {
 
 
 ==================================================
-FILE: packet.cpp
+FILE: safechain_protocol.cpp
 ==================================================
 
-#include "packet.h"
+#include "safechain_protocol.h"
+#include <string.h>
+#include "mbedtls/md.h"  // HMAC-SHA256 — built into ESP32 Arduino core
 
-uint16_t PacketBuilder::seqCounter = 0;
+namespace sc {
 
-void PacketBuilder::build(SafeChainPacket &pkt, 
-                          const char* srcID,
-                          MsgType type,
-                          EmergencyType emType,
-                          float lat, float lon,
-                          uint8_t batt) {
-    memset(&pkt, 0, sizeof(SafeChainPacket));
-    strncpy(pkt.srcID, srcID, 5);
-    pkt.srcID[5] = '\0';
-    
-    pkt.msgType = (type == MSG_EMERGENCY) ? emType : type;
-    pkt.seqNum = seqCounter++;
-    pkt.latitude = lat;
-    pkt.longitude = lon;
-    pkt.hopCount = 0;
-    pkt.maxHop = MAX_HOP;
-    pkt.battery = batt;
-    pkt.rssi = 0;  // ← ADD THIS LINE (Filled by receiver)
-    
-    // Calculate CRC (exclude CRC field itself)
-    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
-}
-
-void PacketBuilder::buildACK(SafeChainPacket &pkt,
-                             const char* srcID,
-                             uint16_t ackSeqNum) {
-    memset(&pkt, 0, sizeof(SafeChainPacket));
-    strncpy(pkt.srcID, srcID, 5);
-    pkt.msgType = MSG_ACK;
-    pkt.seqNum = ackSeqNum;  // Echo back
-    pkt.hopCount = 0;
-    pkt.maxHop = MAX_HOP;
-    pkt.battery = 100;
-    pkt.rssi = 0; // added
-    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
-}
-
-uint16_t PacketBuilder::calcCRC16(const uint8_t *data, uint16_t length) {
+// ---------------------------------------------------------------------------
+// CRC16-CCITT (unchanged)
+// ---------------------------------------------------------------------------
+uint16_t Protocol::calcCRC16(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < length; i++) {
+    for (size_t i = 0; i < len; i++) {
         crc ^= (uint16_t)data[i] << 8;
         for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-            else crc <<= 1;
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
         }
     }
     return crc;
 }
 
-bool PacketBuilder::validate(const SafeChainPacket &pkt) {
-    uint16_t expected = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
-    return (pkt.crc == expected);
+// ---------------------------------------------------------------------------
+// [M3] computeHMAC32 — HMAC-SHA256 over the stable inner payload,
+// truncated to 4 bytes (first 4 bytes of the 32-byte output).
+//
+// Inner payload covers only fields that do NOT change per hop:
+//   protocol_version, frame_type, event_type, flags,
+//   origin_id, event_id, attempt, max_hops,
+//   event_time_ms, lat_e7, lon_e7, battery_pct
+// (30 bytes total)
+//
+// Excluded (change per hop):
+//   sender_id, hop_count, last_rssi_dbm, auth_tag, crc16
+// ---------------------------------------------------------------------------
+uint32_t Protocol::computeHMAC32(const uint8_t* psk, size_t pskLen,
+                                   const SafeChainFrameV1& frame) {
+    // Build the 30-byte stable inner payload
+    uint8_t inner[30];
+    size_t  pos = 0;
+
+    inner[pos++] = frame.protocol_version;
+    inner[pos++] = frame.frame_type;
+    inner[pos++] = frame.event_type;
+    inner[pos++] = frame.flags;
+
+    memcpy(inner + pos, frame.origin_id, DEVICE_ID_LEN); pos += DEVICE_ID_LEN; // 6
+
+    // Little-endian copy of multi-byte fields (packed struct, memcpy is safe)
+    memcpy(inner + pos, &frame.event_id,      4); pos += 4;
+    memcpy(inner + pos, &frame.attempt,       2); pos += 2;
+    inner[pos++] = frame.max_hops;
+    memcpy(inner + pos, &frame.event_time_ms, 4); pos += 4;
+    memcpy(inner + pos, &frame.lat_e7,        4); pos += 4;
+    memcpy(inner + pos, &frame.lon_e7,        4); pos += 4;
+    inner[pos++] = frame.battery_pct;
+
+    // pos should be exactly 30
+    // static_assert commented to allow runtime assert in debug builds
+    // assert(pos == 30);
+
+    // HMAC-SHA256 via mbedTLS (always available in ESP32 Arduino core)
+    uint8_t hmac_out[32];
+    mbedtls_md_hmac(
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+        psk, pskLen,
+        inner, pos,
+        hmac_out
+    );
+
+    // Truncate to 4 bytes
+    uint32_t tag;
+    memcpy(&tag, hmac_out, 4);
+    return tag;
 }
 
-bool PacketBuilder::prepareRelay(SafeChainPacket &pkt) {
-    if (pkt.hopCount >= pkt.maxHop) return false;
-    
-    pkt.hopCount++;
-    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
+// ---------------------------------------------------------------------------
+// initFrame
+// ---------------------------------------------------------------------------
+void Protocol::initFrame(SafeChainFrameV1& frame) {
+    memset(&frame, 0, sizeof(frame));
+    frame.protocol_version = PROTOCOL_VERSION;
+    frame.max_hops         = MAX_HOPS_DEFAULT;
+}
+
+// ---------------------------------------------------------------------------
+// [M3] finalizeFrame — compute auth_tag then crc16
+// Order matters: auth_tag must be set before CRC16 is computed so CRC16
+// covers auth_tag.
+// ---------------------------------------------------------------------------
+void Protocol::finalizeFrame(SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen) {
+    // Step 1: compute and set auth_tag
+    frame.flags   |= FLAG_AUTH_PRESENT;
+    frame.auth_tag = computeHMAC32(psk, pskLen, frame);
+   
+
+    // Step 2: compute CRC16 over everything except the last 2 bytes (crc16 field)
+    frame.crc16 = 0;
+    frame.crc16 = calcCRC16(reinterpret_cast<const uint8_t*>(&frame),
+                             sizeof(SafeChainFrameV1) - sizeof(frame.crc16));
+}
+
+// ---------------------------------------------------------------------------
+// [M3] validateFrame — check crc16, then check auth_tag
+// Returns false if either check fails.
+// ---------------------------------------------------------------------------
+bool Protocol::validateFrame(const SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen) {
+    if (frame.protocol_version != PROTOCOL_VERSION) return false;
+
+    // Step 1: CRC16 wire integrity check
+    SafeChainFrameV1 tmp = frame;
+    uint16_t rx_crc = tmp.crc16;
+    tmp.crc16 = 0;
+    uint16_t ex_crc = calcCRC16(reinterpret_cast<const uint8_t*>(&tmp),
+                                 sizeof(SafeChainFrameV1) - sizeof(tmp.crc16));
+    if (rx_crc != ex_crc) return false;
+
+    // Step 2: HMAC authentication check (only if auth flag is set)
+    if (frame.flags & FLAG_AUTH_PRESENT) {
+        uint32_t expected_tag = computeHMAC32(psk, pskLen, frame);
+        if (frame.auth_tag != expected_tag) {
+            Serial.printf(">>> AUTH FAIL: origin=%s event=%lu — invalid HMAC\n",
+                frame.origin_id, (unsigned long)frame.event_id);
+            return false;
+        }
+    }
+
     return true;
 }
 
-void PacketBuilder::print(const SafeChainPacket &pkt) {
-    Serial.printf("[PKT] ID:%s Type:%02X Seq:%u Hop:%u/%u Lat:%.6f Lon:%.6f Batt:%u%%\n",
-        pkt.srcID, pkt.msgType, pkt.seqNum, pkt.hopCount, pkt.maxHop,
-        pkt.latitude, pkt.longitude, pkt.battery);
+// ---------------------------------------------------------------------------
+// buildEventFrame
+// ---------------------------------------------------------------------------
+void Protocol::buildEventFrame(SafeChainFrameV1& frame,
+                                const char* originId, const char* senderId,
+                                uint32_t eventId, EventType eventType,
+                                uint16_t attempt, uint32_t eventTimeMs,
+                                int32_t latE7, int32_t lonE7,
+                                uint8_t batteryPct, bool gpsValid, bool lowBattery,
+                                const uint8_t* psk, size_t pskLen,
+                                uint8_t maxHops) {
+    initFrame(frame);
+
+    frame.frame_type = FRAME_EVENT;
+    frame.event_type = eventType;
+    frame.flags      = FLAG_REQUIRE_ACK;
+    if (gpsValid)   frame.flags |= FLAG_GPS_VALID;
+    if (lowBattery) frame.flags |= FLAG_LOW_BATTERY;
+
+    strncpy(frame.origin_id, originId, DEVICE_ID_LEN - 1);
+    strncpy(frame.sender_id, senderId, DEVICE_ID_LEN - 1);
+
+    frame.event_id      = eventId;
+    frame.attempt       = attempt;
+    frame.hop_count     = 0;
+    frame.max_hops      = maxHops;
+    frame.event_time_ms = eventTimeMs;
+    frame.lat_e7        = latE7;
+    frame.lon_e7        = lonE7;
+    frame.battery_pct   = batteryPct;
+    frame.last_rssi_dbm = 0;
+
+    finalizeFrame(frame, psk, pskLen);
 }
 
+// ---------------------------------------------------------------------------
+// buildAckFrame
+// ---------------------------------------------------------------------------
+void Protocol::buildAckFrame(SafeChainFrameV1& frame,
+                              const char* gatewayOrRepeaterId,
+                              const char* originId,
+                              uint32_t eventId, EventType eventType,
+                              const uint8_t* psk, size_t pskLen,
+                              uint8_t maxHops) {
+    initFrame(frame);
 
-==================================================
-FILE: router.cpp
-==================================================
+    frame.frame_type = FRAME_ACK;
+    frame.event_type = eventType;
+    frame.flags      = 0;
 
-#include "router.h"
-#include <LoRa.h>
+    strncpy(frame.origin_id, originId,              DEVICE_ID_LEN - 1);
+    strncpy(frame.sender_id, gatewayOrRepeaterId,   DEVICE_ID_LEN - 1);
 
-Router::Router() : cacheIndex(0), relayEnabled(false), isPending(false) {
-    memset(seenCache, 0, sizeof(seenCache));
+    frame.event_id      = eventId;
+    frame.attempt       = 0;
+    frame.hop_count     = 0;
+    frame.max_hops      = maxHops;
+    frame.event_time_ms = millis();
+    frame.battery_pct   = 100;
+    frame.last_rssi_dbm = 0;
+
+    finalizeFrame(frame, psk, pskLen);
 }
 
-void Router::init(const char* nodeID, bool enableRelay) {
-    myNodeID = String(nodeID);
-    relayEnabled = enableRelay;
-}
+// ---------------------------------------------------------------------------
+// prepareRelay — update mutable hop fields and recompute crc16.
+// auth_tag is NOT recomputed (HMAC covers stable inner payload only).
+// ---------------------------------------------------------------------------
+bool Protocol::prepareRelay(SafeChainFrameV1& frame, const char* newSenderId,
+                              const uint8_t* psk, size_t pskLen) {
+    if (frame.hop_count >= frame.max_hops) return false;
 
-void Router::setRelayEnabled(bool enabled) {
-    relayEnabled = enabled;
-}
+    frame.hop_count++;
+    strncpy(frame.sender_id, newSenderId, DEVICE_ID_LEN - 1);
+    frame.sender_id[DEVICE_ID_LEN - 1] = '\0';
 
-bool Router::shouldRelay(const SafeChainPacket &pkt) {
-    if (!relayEnabled) return false;
-    if (isOwnPacket(pkt)) return false;
-    if (isDuplicate(pkt.seqNum)) return false;
-    if (pkt.hopCount >= pkt.maxHop) return false;
-    if (pkt.msgType == MSG_ACK) return false;  // Don't relay ACKs
-    
+    // Recompute CRC16 only — auth_tag remains unchanged (stable fields intact)
+    frame.crc16 = 0;
+    frame.crc16 = calcCRC16(reinterpret_cast<const uint8_t*>(&frame),
+                             sizeof(SafeChainFrameV1) - sizeof(frame.crc16));
+
+    // Suppress unused parameter warning — psk may be used in future
+    (void)psk; (void)pskLen;
     return true;
 }
 
-void Router::queueRelay(const SafeChainPacket &pkt) {
-    memcpy(&pendingPacket, &pkt, sizeof(SafeChainPacket));
-    
-    // Prepare for relay (increment hop, update CRC)
-    if (!PacketBuilder::prepareRelay(pendingPacket)) {
-        Serial.println(">>> Relay prep failed (max hop)");
-        return;
-    }
-    
-    markSeen(pkt.seqNum);
-    
-    // Random backoff
-    relayTriggerTime = millis() + random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
-    isPending = true;
-    
-    Serial.printf(">>> Queued relay: Seq=%u (Wait %lums)\n", 
-        pkt.seqNum, relayTriggerTime - millis());
+// ---------------------------------------------------------------------------
+// Utilities (unchanged)
+// ---------------------------------------------------------------------------
+bool Protocol::makeDedupKey(const SafeChainFrameV1& frame, DedupKey& out) {
+    strncpy(out.origin_id, frame.origin_id, DEVICE_ID_LEN);
+    out.event_id   = frame.event_id;
+    out.frame_type = frame.frame_type;
+    return true;
 }
 
-void Router::update() {
-    if (!isPending) return;
-    if (millis() < relayTriggerTime) return;
-    
-    Serial.println(">>> RELAYING NOW...");
-    
-    LoRa.beginPacket();
-    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    LoRa.endPacket();  // Async // removed true
-    
-    isPending = false;
-    Serial.printf(">>> RELAY SENT: Seq=%u Hop=%u\n", 
-        pendingPacket.seqNum, pendingPacket.hopCount);
+bool Protocol::isEmergencyEvent(const SafeChainFrameV1& frame) {
+    if (frame.frame_type != FRAME_EVENT) return false;
+    return frame.event_type == EVENT_FIRE  ||
+           frame.event_type == EVENT_FLOOD ||
+           frame.event_type == EVENT_CRIME ||
+           frame.event_type == EVENT_SAFE;
 }
 
-void Router::cancelRelay() {
-    if (isPending) {
-        Serial.println("!!! CANCELLING RELAY FOR EMERGENCY !!!");
-        isPending = false;
+const char* Protocol::frameTypeName(uint8_t frameType) {
+    switch (frameType) {
+        case FRAME_EVENT:     return "EVENT";
+        case FRAME_ACK:       return "ACK";
+        case FRAME_HEARTBEAT: return "HEARTBEAT";
+        case FRAME_STATUS:    return "STATUS";
+        case FRAME_CONFIG:    return "CONFIG";
+        default:              return "UNKNOWN";
     }
 }
 
-bool Router::isDuplicate(uint16_t seqNum) {
-    for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
-        if (seenCache[i] == seqNum) return true;
+const char* Protocol::eventTypeName(uint8_t eventType) {
+    switch (eventType) {
+        case EVENT_NONE:  return "NONE";
+        case EVENT_FIRE:  return "FIRE";
+        case EVENT_FLOOD: return "FLOOD";
+        case EVENT_CRIME: return "CRIME";
+        case EVENT_SAFE:  return "SAFE";
+        case EVENT_TEST:  return "TEST";
+        default:          return "UNKNOWN";
     }
-    return false;
 }
 
-void Router::markSeen(uint16_t seqNum) {
-    seenCache[cacheIndex] = seqNum;
-    cacheIndex = (cacheIndex + 1) % DUPLICATE_CACHE_SIZE;
-}
-
-bool Router::isOwnPacket(const SafeChainPacket &pkt) {
-    return (myNodeID == String(pkt.srcID));
-}
+} // namespace sc
 
 
 ==================================================
@@ -1836,6 +2405,20 @@ FILE: storage.cpp
 ==================================================
 
 #include "storage.h"
+#include <string.h>
+
+static constexpr uint32_t NODE_EVENT_MAGIC = 0x53434556; // "SCEV"
+
+static uint16_t recordCRC16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
 
 Storage::Storage() {}
 
@@ -1865,5 +2448,127 @@ uint8_t Storage::getSpreadingFactor() {
 
 void Storage::setSpreadingFactor(uint8_t sf) {
     prefs.putUChar("sf", sf);
+}
+
+uint32_t Storage::getEventCounter() {
+    return prefs.getUInt("evt_ctr", 0);
+}
+
+uint32_t Storage::nextEventCounter() {
+    uint32_t next = prefs.getUInt("evt_ctr", 0) + 1;
+    prefs.putUInt("evt_ctr", next);
+    return next;
+}
+
+void Storage::setEventCounter(uint32_t value) {
+    prefs.putUInt("evt_ctr", value);
+}
+
+bool Storage::savePendingEvent(const NodeEventRecord &record) {
+    NodeEventRecord tmp = record;
+    tmp.magic = NODE_EVENT_MAGIC;
+    tmp.crc16 = 0;
+    tmp.crc16 = recordCRC16(reinterpret_cast<const uint8_t*>(&tmp),
+                             sizeof(NodeEventRecord) - sizeof(tmp.crc16));
+    return prefs.putBytes("pend_evt", &tmp, sizeof(NodeEventRecord))
+           == sizeof(NodeEventRecord);
+}
+
+bool Storage::loadPendingEvent(NodeEventRecord &record) {
+    if (!prefs.isKey("pend_evt")) return false;
+
+    NodeEventRecord tmp{};
+    if (prefs.getBytes("pend_evt", &tmp, sizeof(NodeEventRecord))
+        != sizeof(NodeEventRecord)) return false;
+    if (tmp.magic != NODE_EVENT_MAGIC) return false;
+
+    uint16_t rx = tmp.crc16;
+    tmp.crc16 = 0;
+    if (rx != recordCRC16(reinterpret_cast<const uint8_t*>(&tmp),
+                           sizeof(NodeEventRecord) - sizeof(tmp.crc16)))
+        return false;
+
+    tmp.crc16 = rx;
+    record = tmp;
+    return true;
+}
+
+void Storage::clearPendingEvent() {
+    prefs.remove("pend_evt");
+}
+
+bool Storage::hasPendingEvent() {
+    return prefs.isKey("pend_evt");
+}
+
+// ---------------------------------------------------------------------------
+// [M3] PSK storage
+// ---------------------------------------------------------------------------
+void Storage::getPSK(uint8_t* out, size_t len) {
+    if (len < sc::PSK_LEN) return;
+
+    if (!prefs.isKey("psk")) {
+        // No custom key provisioned — use default dev key
+        memcpy(out, sc::PSK_DEFAULT, sc::PSK_LEN);
+        return;
+    }
+
+    size_t read = prefs.getBytes("psk", out, len);
+    if (read != sc::PSK_LEN) {
+        // Corrupt NVS key — fall back to default
+        memcpy(out, sc::PSK_DEFAULT, sc::PSK_LEN);
+    }
+}
+
+void Storage::setPSK(const uint8_t* key, size_t len) {
+    if (len != sc::PSK_LEN) {
+        Serial.printf(">>> PSK must be exactly %u bytes\n", sc::PSK_LEN);
+        return;
+    }
+    prefs.putBytes("psk", key, len);
+}
+
+bool Storage::hasPSK() {
+    return prefs.isKey("psk");
+}
+
+// ---------------------------------------------------------------------------
+// [M6] TX power storage
+// ---------------------------------------------------------------------------
+uint8_t Storage::getTxPower() {
+    return prefs.getUChar("tx_pwr", LORA_TXPOWER);
+}
+
+void Storage::setTxPower(uint8_t dbm) {
+    if (dbm < 2 || dbm > 20) {
+        Serial.printf(">>> TX power must be 2-20 dBm\n");
+        return;
+    }
+    prefs.putUChar("tx_pwr", dbm);
+}
+
+// ---------------------------------------------------------------------------
+// [M6] Heartbeat interval storage
+// ---------------------------------------------------------------------------
+uint32_t Storage::getHBInterval() {
+    return prefs.getUInt("hb_ms", HEARTBEAT_INTERVAL_MS);
+}
+
+void Storage::setHBInterval(uint32_t ms) {
+    // Clamp to sane range: 30s minimum, 30min maximum
+    if (ms < 30000)   ms = 30000;
+    if (ms > 1800000) ms = 1800000;
+    prefs.putUInt("hb_ms", ms);
+}
+
+// ---------------------------------------------------------------------------
+// [M6] Config dedup — prevents replaying the same config frame
+// ---------------------------------------------------------------------------
+uint32_t Storage::getLastConfigId() {
+    return prefs.getUInt("cfg_id", 0);
+}
+
+void Storage::setLastConfigId(uint32_t id) {
+    prefs.putUInt("cfg_id", id);
 }
 

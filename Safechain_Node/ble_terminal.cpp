@@ -102,7 +102,10 @@ void BLETerminal::setCommandCallback(void (*cb)(String)) {
 void BLETerminal::handleConnect() {
     connected = true;
     Serial.println("\n>>> BLE: Connected");
-    tone(PIN_BUZZER, 4000, 100);
+    ledcWriteTone(PIN_BUZZER, 4000);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(100);
+    ledcWrite(PIN_BUZZER, 0);
 }
 
 void BLETerminal::handleDisconnect() {

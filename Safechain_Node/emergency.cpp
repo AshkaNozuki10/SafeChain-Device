@@ -1,183 +1,309 @@
 #include "emergency.h"
+#include "storage.h"
 #include <LoRa.h>
 #include <OneButton.h>
+#include <string.h>
 
-// 👇 Bring the buttons over from the main file!
 extern OneButton btnFlood;
 extern OneButton btnFire;
 extern OneButton btnCrime;
+extern BLETerminal ble;
 
-extern void flashRGB(int r, int g, int b, int times);  // Forward declare
-extern BLETerminal ble;                                // Forward declare BLE for terminal messages
+static constexpr uint8_t JOURNAL_PENDING_ACK = 1;
+static constexpr uint8_t JOURNAL_ACKED       = 2;
+static constexpr uint8_t JOURNAL_CLEARED     = 3;
 
-EmergencyManager::EmergencyManager() 
-    : state(EM_STATE_IDLE), retryCount(0), lastSendTime(0) {}
-
-void EmergencyManager::init(const char* id) {
-    nodeID = id;
+EmergencyManager::EmergencyManager()
+    : state(EM_STATE_IDLE), retryCount(0),
+      actionScheduledAt(0), actionDelayMs(0), stateSince(0),
+      nodeID(nullptr), storage(nullptr),
+      currentEventId(0), currentEmergencyType(EM_NONE),
+      pendingFrameValid(false) {
+    memset(&pendingFrame, 0, sizeof(pendingFrame));
+    memset(psk, 0, sizeof(psk));
 }
 
-void EmergencyManager::trigger(EmergencyType type, float lat, float lon, uint8_t batt) {
-    PacketBuilder::build(pendingPacket, nodeID, MSG_EMERGENCY, 
-                         type, lat, lon, batt);
-    
-    // If it is a SAFE signal, "Fire and Forget"!
-    if (type == EM_SAFE) {
-        Serial.println("📡 SENDING: Safe Signal Broadcast");
-        
-        // Rapid-fire 3 times to guarantee delivery without waiting for ACKs
-        for(int i = 0; i < 3; i++) {
-            LoRa.beginPacket();
-            LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-            LoRa.endPacket();
-            delay(100); 
-        }
-        LoRa.receive();
-        
-        // INSTANTLY kill the emergency loop and silence the Node
-        state = EM_STATE_IDLE; 
-        
-    } else {
-        // Normal Emergency (Wait for ACK and run retry loops)
-        state = EM_STATE_SENDING;
-        retryCount = 0;
-        transmit();
+void EmergencyManager::init(const char* id, Storage* storageRef) {
+    nodeID  = id;
+    storage = storageRef;
+    reloadPSK();
+    setState(EM_STATE_IDLE);
+}
+
+// [M3] Load PSK from NVS (or default if not provisioned)
+void EmergencyManager::reloadPSK() {
+    if (storage) {
+        storage->getPSK(psk, sc::PSK_LEN);
+        bool custom = storage->hasPSK();
+        Serial.printf(">>> PSK loaded (%s)\n", custom ? "provisioned" : "dev default");
     }
 }
 
-void EmergencyManager::transmit() {
-    String statusMsg = "📡 SENDING: Seq " + String(pendingPacket.seqNum);
-    Serial.println(statusMsg);
-    ble.send(statusMsg);
-    
-    // 1. ALARMS FIRST (Isolate the power draw)
-    tone(PIN_BUZZER, 4000, 100); 
-    delay(100); // Let the buzzer completely finish
-    
-    // Use a low-power color (Dim Cyan) instead of maximum-power White!
-    flashRGB(0, 50, 50, 2); 
-    
-    // 2. TRANSMIT SECOND (Now 100% of the battery power can go to the LoRa antenna)
+void EmergencyManager::setState(EmergencyState newState) {
+    state      = newState;
+    stateSince = millis();
+}
+
+void EmergencyManager::scheduleAction(uint32_t delayMs) {
+    actionScheduledAt = millis();
+    actionDelayMs     = delayMs;
+}
+
+bool EmergencyManager::isActionDue() const {
+    return (millis() - actionScheduledAt) >= actionDelayMs;
+}
+
+sc::EventType EmergencyManager::toProtocolEventType(EmergencyType type) const {
+    switch (type) {
+        case EM_FIRE:  return sc::EVENT_FIRE;
+        case EM_FLOOD: return sc::EVENT_FLOOD;
+        case EM_CRIME: return sc::EVENT_CRIME;
+        case EM_SAFE:  return sc::EVENT_SAFE;
+        default:       return sc::EVENT_NONE;
+    }
+}
+
+EmergencyType EmergencyManager::fromProtocolEventType(uint8_t type) const {
+    switch (type) {
+        case sc::EVENT_FIRE:  return EM_FIRE;
+        case sc::EVENT_FLOOD: return EM_FLOOD;
+        case sc::EVENT_CRIME: return EM_CRIME;
+        case sc::EVENT_SAFE:  return EM_SAFE;
+        default:              return EM_NONE;
+    }
+}
+
+int32_t EmergencyManager::toFixedPointE7(float value) const {
+    return (int32_t)(value * 10000000.0f);
+}
+
+bool EmergencyManager::saveJournal(uint8_t journalState) {
+    if (!storage || !pendingFrameValid) return false;
+    NodeEventRecord rec{};
+    rec.event_id    = pendingFrame.event_id;
+    rec.event_type  = pendingFrame.event_type;
+    rec.attempt     = pendingFrame.attempt;
+    rec.state       = journalState;
+    rec.battery_pct = pendingFrame.battery_pct;
+    rec.lat_e7      = pendingFrame.lat_e7;
+    rec.lon_e7      = pendingFrame.lon_e7;
+    rec.created_ms  = pendingFrame.event_time_ms;
+    rec.updated_ms  = millis();
+    bool ok = storage->savePendingEvent(rec);
+    if (!ok) Serial.println(">>> ERROR: journal save failed");
+    return ok;
+}
+
+void EmergencyManager::clearJournal() {
+    if (storage) storage->clearPendingEvent();
+}
+
+// ---------------------------------------------------------------------------
+// trigger — [M3] passes PSK to buildEventFrame
+// ---------------------------------------------------------------------------
+void EmergencyManager::trigger(EmergencyType type, float lat, float lon, uint8_t batt) {
+    if (!storage || !nodeID) {
+        Serial.println(">>> ERROR: EmergencyManager not initialized");
+        return;
+    }
+
+    currentEmergencyType = type;
+    currentEventId       = storage->nextEventCounter();
+    retryCount           = 0;
+
+    bool gpsValid   = !(lat == 0.0f && lon == 0.0f);
+    bool lowBattery = (batt <= 15);
+
+    // [M3] PSK passed to buildEventFrame — auth_tag computed inside
+    sc::Protocol::buildEventFrame(
+        pendingFrame,
+        nodeID, nodeID,
+        currentEventId,
+        toProtocolEventType(type),
+        0,
+        millis(),
+        toFixedPointE7(lat),
+        toFixedPointE7(lon),
+        batt, gpsValid, lowBattery,
+        psk, sc::PSK_LEN
+    );
+
+    pendingFrameValid = true;
+    if (!saveJournal(JOURNAL_PENDING_ACK))
+        Serial.println(">>> WARNING: event created but journal save failed");
+
+    Serial.printf("EVENT CREATED: ID %lu TYPE %s (auth_tag=0x%08lX)\n",
+        (unsigned long)pendingFrame.event_id,
+        sc::Protocol::eventTypeName(pendingFrame.event_type),
+        (unsigned long)pendingFrame.auth_tag);
+    ble.send("EVENT CREATED");
+
+    setState(EM_STATE_PENDING_TX);
+    scheduleAction(0);
+}
+
+// ---------------------------------------------------------------------------
+// transmitNow — [M3] re-finalizes with PSK before each TX
+// ---------------------------------------------------------------------------
+void EmergencyManager::transmitNow() {
+    if (!pendingFrameValid) return;
+
+    pendingFrame.attempt   = retryCount;
+    pendingFrame.hop_count = 0;
+    strncpy(pendingFrame.sender_id, nodeID, sc::DEVICE_ID_LEN - 1);
+    pendingFrame.sender_id[sc::DEVICE_ID_LEN - 1] = '\0';
+
+    // [M3] Re-finalize: recompute auth_tag and crc16 (attempt/sender may have changed)
+    sc::Protocol::finalizeFrame(pendingFrame, psk, sc::PSK_LEN);
+    saveJournal(JOURNAL_PENDING_ACK);
+
+    Serial.printf("TX: EventID %lu Attempt %u auth=0x%08lX\n",
+        (unsigned long)pendingFrame.event_id, pendingFrame.attempt,
+        (unsigned long)pendingFrame.auth_tag);
+    ble.send("SENDING EVENT");
+
+    ledcWriteTone(PIN_BUZZER, 4000);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(100);
+    ledcWrite(PIN_BUZZER, 0);
+
     LoRa.beginPacket();
-    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    LoRa.endPacket(); // Blocking send
-    
-    LoRa.receive(); // Turn ears back on
-    
-    state = EM_STATE_WAITING_ACK;
-    lastSendTime = millis();
+    LoRa.write((uint8_t*)&pendingFrame, sizeof(sc::SafeChainFrameV1));
+    LoRa.endPacket();
+    LoRa.receive();
 
+    setState(EM_STATE_WAITING_ACK);
+    scheduleAction(ACK_TIMEOUT_MS);
+}
 
-    // String statusMsg = "📡 SENDING: Seq " + String(pendingPacket.seqNum);
-    // Serial.println(statusMsg);
-    // ble.send(statusMsg);
-    
-    // // 👇 LOUD, PIERCING BEEP FOR SENDING (High 4000Hz tone)
-    // tone(PIN_BUZZER, 4000, 200); 
-    
-    // flashRGB(255, 255, 255, 2);  // White flash
-    
-    // LoRa.beginPacket();
-    // LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    // LoRa.endPacket();  // Blocking send
-    
-    // LoRa.receive();    // Turn ears back on to listen for ACK
-    
-    // state = EM_STATE_WAITING_ACK;
-    // lastSendTime = millis();
-    
+void EmergencyManager::scheduleRetry() {
+    if (!pendingFrameValid) return;
+    if (retryCount >= MAX_RETRIES) { markFailed(); return; }
+
+    retryCount++;
+    uint32_t minD, maxD;
+    switch (retryCount) {
+        case 1: minD=600;  maxD=900;   break;
+        case 2: minD=1800; maxD=2400;  break;
+        case 3: minD=4000; maxD=5000;  break;
+        default:minD=8000; maxD=10000; break;
+    }
+    uint32_t backoff = random(minD, maxD + 1);
+    Serial.printf("RETRY %u/%u EventID %lu after %lums\n",
+        retryCount, MAX_RETRIES,
+        (unsigned long)pendingFrame.event_id, (unsigned long)backoff);
+    ble.send("RETRYING");
+    ledcWriteTone(PIN_BUZZER, 800);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(50);
+    ledcWrite(PIN_BUZZER, 0);
+
+    pendingFrame.attempt       = retryCount;
+    pendingFrame.event_time_ms = millis();
+    sc::Protocol::finalizeFrame(pendingFrame, psk, sc::PSK_LEN);
+    saveJournal(JOURNAL_PENDING_ACK);
+
+    setState(EM_STATE_PENDING_TX);
+    scheduleAction(backoff);
+}
+
+void EmergencyManager::markFailed() {
+    Serial.println(">>> FAILED - No ACK after all retries");
+    ble.send("FAILED - Auto-retry in 60s.");
+    ledcWriteTone(PIN_BUZZER, 500);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(1000);
+    ledcWrite(PIN_BUZZER, 0);
+    saveJournal(JOURNAL_PENDING_ACK);
+    setState(EM_STATE_FAILED);
+    scheduleAction(FAILED_RETRY_INTERVAL_MS);
+}
+
+void EmergencyManager::markConfirmed() {
+    Serial.println(">>> ACK RECEIVED - SUCCESS!");
+    ble.send("ALERT CONFIRMED - Help is on the way!");
+    ledcWriteTone(PIN_BUZZER, 2500);
+    ledcWrite(PIN_BUZZER, 128);
+    delay(150);
+    ledcWrite(PIN_BUZZER, 0);
+    saveJournal(JOURNAL_ACKED);
+    clearJournal();
+    pendingFrameValid    = false;
+    currentEventId       = 0;
+    currentEmergencyType = EM_NONE;
+    retryCount           = 0;
+    setState(EM_STATE_CONFIRMED);
+    scheduleAction(1000);
 }
 
 void EmergencyManager::update() {
-    if (state != EM_STATE_WAITING_ACK) return;
-    
-    // Check timeout
-    if (millis() - lastSendTime > ACK_TIMEOUT_MS) {
-        retry();
-    }
-}
+    btnFlood.tick();
+    btnFire.tick();
+    btnCrime.tick();
 
-void EmergencyManager::retry() {
-    if (retryCount < MAX_RETRIES) {
-        retryCount++;
-        
-        // Exponential backoff with jitter
-        uint32_t minDelay = 4000 * (1 << (retryCount - 1));
-        uint32_t maxDelay = minDelay * 2;
-        uint32_t backoff = random(minDelay, maxDelay);
-        
-        String retryMsg = "⚠️ RETRY " + String(retryCount) + "/" + String(MAX_RETRIES) + 
-                          " (Wait: " + String(backoff / 1000) + "s)";
-        Serial.println(retryMsg);
-        ble.send(retryMsg);
-        
-        flashRGB(255, 100, 0, 2); // Orange flash
-        
-        // 👇 THE NEW HEARTBEAT TIMER LOOP
-        unsigned long startWait = millis();
-        while (millis() - startWait < backoff) {
-            // "Ba-bum" heartbeat sound (Low 800Hz tone)
-            tone(PIN_BUZZER, 800, 50);
-            delay(100);
-            
-            // Check if time is up before the second beat
-            if (millis() - startWait >= backoff) break;
-            tone(PIN_BUZZER, 800, 50); 
-            
-            // Gap between heartbeats (approx 850ms)
-            unsigned long gapStart = millis();
-            while (millis() - gapStart < 850) {
-                
-                // 👇 FIX 2: Keep the buttons alive while waiting!
-                btnFlood.tick();
-                btnFire.tick();
-                btnCrime.tick();
-                
-                // If the user double-clicked SAFE, triggerSafe() instantly sets 
-                // the state to IDLE. If we see IDLE, abort the retry immediately!
-                if (state == EM_STATE_IDLE) return; 
-
-                if (millis() - startWait >= backoff) break;
-                delay(10);
+    switch (state) {
+        case EM_STATE_IDLE: break;
+        case EM_STATE_PENDING_TX:
+            if (isActionDue()) transmitNow();
+            break;
+        case EM_STATE_WAITING_ACK:
+            if (isActionDue()) scheduleRetry();
+            break;
+        case EM_STATE_CONFIRMED:
+            if (isActionDue()) setState(EM_STATE_IDLE);
+            break;
+        case EM_STATE_FAILED:
+            if (isActionDue() && pendingFrameValid) {
+                Serial.println(">>> FAILED RECOVERY: re-attempting");
+                ble.send("Auto-retrying failed emergency event");
+                retryCount = 0;
+                setState(EM_STATE_PENDING_TX);
+                scheduleAction(0);
             }
-        }
-        
-        // Final safety catch just in case it was pressed at the last millisecond
-        if (state == EM_STATE_IDLE) return;
-        
-        // Generate new sequence number
-        pendingPacket.seqNum = PacketBuilder::seqCounter++;
-        pendingPacket.crc = PacketBuilder::calcCRC16((uint8_t*)&pendingPacket, sizeof(SafeChainPacket) - 2);
-        
-        transmit();
-    } else {
-        fail();
+            break;
+        default: break;
     }
 }
 
-void EmergencyManager::fail() {
-    Serial.println(">>> FAILED - No ACK after retries");
-    // Send failure to the Bluetooth Terminal
-    ble.send("❌ FAILED - No network acknowledgment received.");
-    flashRGB(255, 0, 0, 5);  // Red
-    // Sad "Failed" Low-Beep (from our previous buzzer upgrade)
-    tone(PIN_BUZZER, 500, 1000);    
-    state = EM_STATE_FAILED;
-}
-
-void EmergencyManager::confirm() {
-    Serial.println(">>> ACK RECEIVED - SUCCESS!");
-    // Send success to the Bluetooth Terminal
-    ble.send("✅ ALERT CONFIRMED - Help is on the way!");
-    flashRGB(0, 255, 0, 3);  // Green
-    // Happy "Success" Double-Beep (from our previous buzzer upgrade)
-    tone(PIN_BUZZER, 2500, 150); delay(200);
-    state = EM_STATE_CONFIRMED;
-}
-
-void EmergencyManager::handleACK(const SafeChainPacket &ack) {
+// ---------------------------------------------------------------------------
+// handleACK — [M3] validateFrame checks HMAC too
+// ---------------------------------------------------------------------------
+void EmergencyManager::handleACK(const sc::SafeChainFrameV1 &ack) {
     if (state != EM_STATE_WAITING_ACK) return;
-    if (ack.seqNum != pendingPacket.seqNum) return;
-    
-    confirm();
+    if (!pendingFrameValid) return;
+    if (!sc::Protocol::validateFrame(ack, psk, sc::PSK_LEN)) return;
+    if (ack.frame_type != sc::FRAME_ACK) return;
+    if (strncmp(ack.origin_id, nodeID, sc::DEVICE_ID_LEN) != 0) return;
+    if (ack.event_id != pendingFrame.event_id) return;
+    markConfirmed();
+}
+
+bool EmergencyManager::resumePending() {
+    if (!storage || !nodeID) return false;
+    NodeEventRecord rec{};
+    if (!storage->loadPendingEvent(rec)) return false;
+    if (rec.state != JOURNAL_PENDING_ACK) return false;
+
+    currentEventId       = rec.event_id;
+    currentEmergencyType = fromProtocolEventType(rec.event_type);
+    retryCount           = rec.attempt;
+    bool gpsValid   = !(rec.lat_e7 == 0 && rec.lon_e7 == 0);
+    bool lowBattery = (rec.battery_pct <= 15);
+
+    sc::Protocol::buildEventFrame(
+        pendingFrame, nodeID, nodeID,
+        rec.event_id, static_cast<sc::EventType>(rec.event_type),
+        rec.attempt, rec.created_ms,
+        rec.lat_e7, rec.lon_e7, rec.battery_pct,
+        gpsValid, lowBattery,
+        psk, sc::PSK_LEN
+    );
+
+    pendingFrameValid = true;
+    Serial.printf(">>> RESUMING PENDING EVENT: ID=%lu attempt=%u\n",
+        (unsigned long)pendingFrame.event_id, pendingFrame.attempt);
+    ble.send("Resuming pending emergency event after reboot");
+    setState(EM_STATE_PENDING_TX);
+    scheduleAction(500);
+    return true;
 }

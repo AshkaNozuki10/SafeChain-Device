@@ -51,8 +51,10 @@ void Router::update() {
     
     LoRa.beginPacket();
     LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    LoRa.endPacket();  // Async // removed true
+    LoRa.endPacket();  // Async // removed true 
     
+    LoRa.receive();
+
     isPending = false;
     Serial.printf(">>> RELAY SENT: Seq=%u Hop=%u\n", 
         pendingPacket.seqNum, pendingPacket.hopCount);
@@ -64,7 +66,7 @@ void Router::cancelRelay() {
         isPending = false;
     }
 }
-
+    
 bool Router::isDuplicate(uint16_t seqNum) {
     for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
         if (seenCache[i] == seqNum) return true;

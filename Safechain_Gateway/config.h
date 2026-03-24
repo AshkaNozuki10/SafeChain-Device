@@ -21,8 +21,17 @@
 #define LORA_TXPOWER    20
 
 // === PROTOCOL ===
-#define DUPLICATE_CACHE_SIZE 100
-#define MAX_EVENTS      50
+#define DUPLICATE_CACHE_SIZE    100
+#define MAX_EVENTS              50
+#define DEFAULT_NODE_ID         "GTW01"
+
+// === HEARTBEAT & NODE REGISTRY [M5] ===
+#define NODE_OFFLINE_THRESHOLD_MS   1080000UL // 18 minutes
+#define NODE_OFFLINE_CHECK_MS       60000UL   // 1 minute
+
+// === WATCHDOG & HEALTH [M1] ===
+#define WDT_TIMEOUT_S               15
+#define LORA_HEALTH_CHECK_INTERVAL_MS 30000
 
 // === MESSAGE TYPES ===
 enum MsgType : uint8_t {
@@ -32,7 +41,6 @@ enum MsgType : uint8_t {
     MSG_TEST      = 0xFF
 };
 
-// === EMERGENCY TYPES (used in msgType field for emergencies) ===
 enum EmergencyType : uint8_t {
     EM_NONE  = 0x00,
     EM_FIRE  = 0x01,

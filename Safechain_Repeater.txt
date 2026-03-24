@@ -3,196 +3,245 @@
 FILE: Safechain_Repeater.ino
 ==================================================
 
+// ============================================================
+// Safechain_Repeater.ino  —  M0 + M1 + M3(auth)
+// ============================================================
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
-#include "packet.h"
 #include "router.h"
-#include "storage.h"       // <-- FIX: Tells the main file what Storage is
+#include "storage.h"
 #include "ble_terminal.h"
+#include "safechain_protocol.h"
+#include "debug_log.h"
 
 // === OBJECTS ===
-RepeaterRouter router;
+RepeaterRouter    router;
 Adafruit_NeoPixel strip(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
-Storage storage;
-BLETerminal ble;
+Storage           storage;
+BLETerminal       ble;
 
-// === STATS ===
-unsigned long lastStatsTime = 0;
-const unsigned long STATS_INTERVAL = 60000;  // Every 1 minute
+// === STATE ===
+RTC_DATA_ATTR int bootCount       = 0;
+RTC_DATA_ATTR int loraReinitCount = 0;
+uint32_t          loraFaultCount  = 0;
+unsigned long     lastStatsTime   = 0;
+unsigned long     lastLoraHealthCheck = 0;
+const unsigned long STATS_INTERVAL = 60000;
 
-unsigned long lastKeepAlive = 0;
-
-// === BLE NOTIFICATION HELPER ===
-void notifyBLE(String msg) {
-    if (ble.isConnected()) {
-        ble.send(msg);
-    }
-}
-
-// === BLE COMMAND HANDLER ===
-void onBLECommand(String cmd) {
-    cmd.trim(); cmd.toLowerCase();
-    if (cmd == "stats") router.printStats();
-    else if (cmd == "ping") notifyBLE("PONG: Repeater is alive and listening!");
-    else notifyBLE("Commands: stats, ping");
-}
+// [M3] Repeater PSK — used for validateFrame on inbound AND prepareRelay
+uint8_t repPSK[sc::PSK_LEN];
 
 // === HELPERS ===
-void setRGB(int r, int g, int b) {
-    strip.setPixelColor(0, strip.Color(r, g, b));
-    strip.show();
+void setRGB(int r, int g, int b) { strip.setPixelColor(0, strip.Color(r,g,b)); strip.show(); }
+void flashRGB(int r, int g, int b, int t) {
+    for (int i=0;i<t;i++) { setRGB(r,g,b); delay(100); setRGB(0,0,0); delay(100); }
 }
 
-void flashRGB(int r, int g, int b, int times) {
-    for (int i = 0; i < times; i++) {
-        setRGB(r, g, b);
-        delay(100);
-        setRGB(0, 0, 0);
-        delay(100);
-    }
+void loadRepPSK() {
+    storage.getPSK(repPSK, sc::PSK_LEN);
+    router.reloadPSK(repPSK, sc::PSK_LEN);
+    Serial.printf(">>> PSK loaded (%s)\n", storage.hasPSK() ? "provisioned" : "dev-default");
+}
+
+void onBLECommand(String cmd) {
+    cmd.trim(); cmd.toLowerCase();
+    if      (cmd == "stats") router.printStats();
+    else if (cmd == "ping")  ble.send("PONG: Repeater alive");
+    else ble.send("Commands: stats, ping");
+}
+
+// ============================================================
+// Direct SPI register read (private in arduino-LoRa)
+// ============================================================
+uint8_t readLoRaRegister(uint8_t reg) {
+    digitalWrite(SS_PIN, LOW);
+    SPI.transfer(reg & 0x7F);
+    uint8_t val = SPI.transfer(0x00);
+    digitalWrite(SS_PIN, HIGH);
+    return val;
+}
+
+// ============================================================
+// LoRa reinit [M1-3/4]
+// ============================================================
+bool loraReinit() {
+    Serial.printf(">>> LoRa reinit (fault #%lu)...\n", (unsigned long)(loraFaultCount+1));
+    LoRa.end(); delay(100);
+    pinMode(RST_PIN, OUTPUT);
+    digitalWrite(RST_PIN, HIGH); delay(10);
+    digitalWrite(RST_PIN, LOW);  delay(10);
+    digitalWrite(RST_PIN, HIGH); delay(20);
+    bool ok = false;
+    for (int i=1;i<=3;i++) { if (LoRa.begin(LORA_FREQ)) { ok=true; break; } delay(200); }
+    if (!ok) { loraFaultCount++; loraReinitCount++; return false; }
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW); LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE); LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD); LoRa.setTxPower(LORA_TXPOWER); LoRa.setGain(0);
+    LoRa.receive();
+    loraReinitCount++;
+    Serial.printf(">>> LoRa reinit OK (#%d)\n", loraReinitCount);
+    return true;
 }
 
 void setup() {
     Serial.begin(115200);
     delay(2000);
-    
-    for(int i = 0; i < 50 && !Serial; i++) {
-        delay(100);
-    }
-    
-    Serial.println("\n\n=== SAFECHAIN REPEATER v2.0 ===");
-    Serial.flush();
-    
-    // Init Storage and BLE
-    storage.init();
-    ble.init(storage.getNodeID().c_str());
-    ble.setCommandCallback(onBLECommand);
+    for (int i=0; i<50 && !Serial; i++) delay(100);
 
-    // LED Init
-    strip.begin();
-    strip.setBrightness(50);
-    flashRGB(50, 0, 50, 2);  // Purple boot
-    
-    // LoRa Init
-    Serial.println(">>> Init LoRa...");
-    Serial.flush();
-    
+    bootCount++;
+    Serial.printf("\n\n=== SAFECHAIN REPEATER v2.2 (Boot #%d) ===\n", bootCount);
+    DebugLog::init(LOG_LEVEL_DEFAULT);
+
+    // [M1-2] Reboot reason
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char* rs = "unknown";
+    switch (reason) {
+        case ESP_RST_POWERON:  rs="power-on";           break;
+        case ESP_RST_BROWNOUT: rs="brownout";           break;
+        case ESP_RST_TASK_WDT: rs="TASK-WATCHDOG";      break;
+        case ESP_RST_INT_WDT:  rs="INTERRUPT-WATCHDOG"; break;
+        case ESP_RST_PANIC:    rs="panic";              break;
+        case ESP_RST_SW:       rs="software";           break;
+        default: break;
+    }
+    Serial.printf(">>> Reset reason: %s\n", rs);
+    if (reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT)
+        Serial.println("!!! WATCHDOG RESET DETECTED !!!");
+
+    // [M1-1] Watchdog
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms=WDT_TIMEOUT_S*1000, .idle_core_mask=0, .trigger_panic=true
+    };
+    esp_err_t wdtErr = esp_task_wdt_init(&wdt_config);
+    if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdt_config);
+    esp_err_t addErr = esp_task_wdt_add(NULL);
+    if (addErr != ESP_OK && addErr != ESP_ERR_INVALID_STATE)
+        Serial.printf(">>> WDT add failed: %d\n", (int)addErr);
+    esp_task_wdt_reset();
+
+    storage.init();
+    String nodeId = storage.getNodeID();
+    loadRepPSK(); // [M3]
+
+    Serial.printf(">>> Node ID: %s | PSK: %s\n",
+        nodeId.c_str(), storage.hasPSK() ? "provisioned" : "dev-default");
+    Serial.printf("REPEATER FW=v2.2 | V1_SIZE=%u\n", (unsigned)sizeof(sc::SafeChainFrameV1));
+
+    ble.init(nodeId.c_str());
+    ble.setCommandCallback(onBLECommand);
+    esp_task_wdt_reset();
+
+    strip.begin(); strip.setBrightness(50); flashRGB(50, 0, 50, 2);
+
     SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
     LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
-    
     if (!LoRa.begin(LORA_FREQ)) {
-        Serial.println("❌ LoRa Init Failed!");
-        Serial.flush();
-        while (1) {
-            flashRGB(255, 0, 0, 1);
-            delay(1000);
-        }
+        Serial.println("LoRa Init Failed!");
+        while (1) { flashRGB(255,0,0,1); delay(1000); esp_task_wdt_reset(); }
     }
-    
     LoRa.setSpreadingFactor(LORA_SF);
-    LoRa.setSignalBandwidth(LORA_BW);
-    LoRa.setCodingRate4(LORA_CR);
-    LoRa.setPreambleLength(LORA_PREAMBLE);
-    LoRa.enableCrc();
-    LoRa.setSyncWord(LORA_SYNCWORD);
-    LoRa.setTxPower(LORA_TXPOWER);
+    LoRa.setSignalBandwidth(LORA_BW); LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE); LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD); LoRa.setTxPower(LORA_TXPOWER); LoRa.setGain(0);
+    randomSeed(esp_random());
 
-    LoRa.setGain(0);
-    
-    randomSeed(analogRead(0));
-    
-    Serial.println("✅ LoRa Ready (SF12, 14dBm)");
-    Serial.flush();
-    
-    // Router Init
-    router.init();
-    
-    setRGB(0, 0, 0);  // LED off to save power
-    LoRa.receive();  // <--- ADD THIS HERE!
-    
-    Serial.println("\n=================================");
+    router.init(nodeId.c_str()); // [M0-5]
+    setRGB(0,0,0);
+    LoRa.receive();
+    lastLoraHealthCheck = millis();
+    esp_task_wdt_reset();
+
+    Serial.println("LoRa Ready");
+    Serial.println("=================================");
     Serial.println("   REPEATER ACTIVE");
     Serial.println("=================================");
-    Serial.flush();
 }
 
 void loop() {
-    // Router update
+    esp_task_wdt_reset();
     router.update();
 
-    // 👇 ADD THIS ENTIRE KEEP-ALIVE BLOCK
-    if (millis() - lastKeepAlive > 12000) {  // Trigger every 12 seconds
-        lastKeepAlive = millis();
-        
-        // 1. Build a dummy Heartbeat packet
-        SafeChainPacket keepAlivePkt;
-        PacketBuilder::build(keepAlivePkt, storage.getNodeID().c_str(), 
-                             MSG_HEARTBEAT, EM_NONE, 0.0, 0.0, 100);
-        
-        // 2. Blast it at 20dBm to force a 120mA power draw from the battery!
-        LoRa.beginPacket();
-        LoRa.write((uint8_t*)&keepAlivePkt, sizeof(SafeChainPacket));
-        LoRa.endPacket(); // Blocking send
-        
-        // 3. Immediately turn the listening ears back on
-        LoRa.receive(); 
-    }
-    // 👆 END OF KEEP-ALIVE BLOCK
-    
-    // LoRa RX
     int packetSize = LoRa.parsePacket();
-    if (packetSize == sizeof(SafeChainPacket)) {
-        SafeChainPacket rxPkt;
-        LoRa.readBytes((uint8_t*)&rxPkt, sizeof(SafeChainPacket));
-        
-        if (PacketBuilder::validate(rxPkt)) {
-            rxPkt.rssi = LoRa.packetRssi();
-            
-            Serial.printf("\n[RX] ");
-            PacketBuilder::print(rxPkt);
-            
-            // Purple flash on receive
+
+    if (packetSize == sizeof(sc::SafeChainFrameV1)) {
+        sc::SafeChainFrameV1 rxFrame;
+        LoRa.readBytes((uint8_t*)&rxFrame, sizeof(sc::SafeChainFrameV1));
+
+        // [M3] validateFrame checks CRC16 + HMAC before relay decision
+        if (sc::Protocol::validateFrame(rxFrame, repPSK, sc::PSK_LEN)) {
+            rxFrame.last_rssi_dbm = LoRa.packetRssi();
+            Serial.printf("\n[RX V1] Frame=%s Event=%s Origin=%s EventID=%lu Hop=%u RSSI=%d auth=OK\n",
+                sc::Protocol::frameTypeName(rxFrame.frame_type),
+                sc::Protocol::eventTypeName(rxFrame.event_type),
+                rxFrame.origin_id, (unsigned long)rxFrame.event_id,
+                rxFrame.hop_count, rxFrame.last_rssi_dbm);
             flashRGB(50, 0, 50, 1);
-            
-            // Check if should relay
-            if (router.shouldRelay(rxPkt)) {
-                // Magenta flash for relay queue
+            if (router.shouldRelayV1(rxFrame)) {
                 flashRGB(255, 0, 255, 1);
-                router.queueRelay(rxPkt);
+                router.queueRelayV1(rxFrame);
             }
         } else {
-            Serial.println(">>> CRC FAIL - Dropped");
+            Serial.println(">>> VALIDATE FAIL - CRC or AUTH — Dropped V1");
         }
+
+    } else if (packetSize > 0) {
+        while (LoRa.available()) LoRa.read();
+        Serial.printf(">>> WARNING: Unknown size: %d\n", packetSize);
     }
-    
-    // Periodic stats
-    if (millis() - lastStatsTime > STATS_INTERVAL) {
+
+    // [M1-3] LoRa health check
+    if ((millis() - lastLoraHealthCheck) >= LORA_HEALTH_CHECK_INTERVAL_MS) {
+        lastLoraHealthCheck = millis();
+        LoRa.receive();
+        uint8_t v = readLoRaRegister(0x42);
+        if (v != 0x12) { Serial.printf(">>> LoRa health FAIL: 0x%02X\n", v); loraFaultCount++; loraReinit(); }
+        else Serial.printf(">>> LoRa health OK | faults=%lu\n", (unsigned long)loraFaultCount);
+    }
+
+    if ((millis() - lastStatsTime) > STATS_INTERVAL) {
         lastStatsTime = millis();
         router.printStats();
+        Serial.printf("LoRa faults: %lu | reinits: %d\n", (unsigned long)loraFaultCount, loraReinitCount);
     }
-    
-    // Serial commands
+
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-        cmd.toLowerCase();
-        
-        if (cmd == "stats") {
-            router.printStats();
-        } else if (cmd == "help") {
-            Serial.println("\n--- COMMANDS ---");
-            Serial.println("stats - Show statistics");
-            Serial.println("help  - This menu");
+        cmd.trim(); cmd.toLowerCase();
+        int sp = cmd.indexOf(' ');
+        String verb = (sp == -1) ? cmd : cmd.substring(0, sp);
+        String arg  = (sp == -1) ? "" : cmd.substring(sp + 1);
+
+        if      (verb == "stats") { router.printStats(); }
+        // [M3] setpsk <32 hex chars>
+        else if (verb == "setpsk") {
+            if (arg.length() == 32) {
+                uint8_t newKey[sc::PSK_LEN]; bool ok = true;
+                for (int i = 0; i < sc::PSK_LEN; i++) {
+                    long v = strtol(arg.substring(i*2, i*2+2).c_str(), nullptr, 16);
+                    if (v<0||v>255) { ok=false; break; }
+                    newKey[i] = (uint8_t)v;
+                }
+                if (ok) { storage.setPSK(newKey, sc::PSK_LEN); loadRepPSK(); Serial.println("PSK provisioned."); }
+                else      Serial.println("Invalid hex.");
+            } else Serial.println("Usage: setpsk <32 hex chars>");
+        }
+        else if (verb == "showpsk") {
+            Serial.printf("PSK: %s | first4=%02X%02X%02X%02X\n",
+                storage.hasPSK() ? "provisioned" : "dev-default",
+                repPSK[0], repPSK[1], repPSK[2], repPSK[3]);
+        }
+        else if (verb == "help") {
+            Serial.println("stats | setpsk <32hex> | showpsk | help");
         }
     }
-    
+
     delay(10);
 }
-
-
 
 
 ==================================================
@@ -318,7 +367,7 @@ FILE: config.h
 // === HARDWARE PINS ===
 #define PIN_RGB         2
 #define SCK_PIN         4
-#define MISO_PIN        5 //orig 5
+#define MISO_PIN        5
 #define MOSI_PIN        6
 #define SS_PIN          7
 #define RST_PIN         8
@@ -331,14 +380,20 @@ FILE: config.h
 #define LORA_CR         8
 #define LORA_PREAMBLE   16
 #define LORA_SYNCWORD   0xF3
-#define LORA_TXPOWER    20  // Higher power for repeater
+#define LORA_TXPOWER    20
 
 // === PROTOCOL ===
-#define MAX_HOP         10
-#define DUPLICATE_CACHE_SIZE 50  // Larger cache for repeater
-#define RELAY_MIN_DELAY 300
-#define RELAY_MAX_DELAY 1000
-#define DEFAULT_NODE_ID "REP08" // Change to "REP02", "REP03", etc.
+#define MAX_HOP                 10
+#define DUPLICATE_CACHE_SIZE    50
+#define RELAY_MIN_DELAY         300
+#define RELAY_MAX_DELAY         1000
+// [M0-BONUS] Drop relay entries queued longer than this (stale after radio fault)
+#define RELAY_TTL_MS            30000
+#define DEFAULT_NODE_ID         "REP01"
+
+// === WATCHDOG & HEALTH [M1] ===
+#define WDT_TIMEOUT_S               15
+#define LORA_HEALTH_CHECK_INTERVAL_MS 30000
 
 // === MESSAGE TYPES ===
 enum MsgType : uint8_t {
@@ -348,7 +403,6 @@ enum MsgType : uint8_t {
     MSG_TEST      = 0xFF
 };
 
-// <-- FIX: Added missing EmergencyType enum
 enum EmergencyType : uint8_t {
     EM_NONE  = 0x00,
     EM_FIRE  = 0x01,
@@ -357,6 +411,43 @@ enum EmergencyType : uint8_t {
     EM_SAFE  = 0x04,
     EM_TEST  = 0xFF
 };
+
+#endif
+
+
+==================================================
+FILE: debug_log.h
+==================================================
+
+#ifndef DEBUG_LOG_H
+#define DEBUG_LOG_H
+
+#include <Arduino.h>
+
+enum LogLevel : uint8_t {
+    LOG_QUIET = 0,
+    LOG_INFO  = 1,
+    LOG_DEBUG = 2
+};
+
+#ifndef LOG_LEVEL_DEFAULT
+#define LOG_LEVEL_DEFAULT LOG_INFO
+#endif
+
+class DebugLog {
+public:
+    static void init(uint8_t level = LOG_LEVEL_DEFAULT);
+    static void setLevel(uint8_t level);
+    static uint8_t getLevel();
+
+    static bool quiet();
+    static bool info();
+    static bool debug();
+};
+
+#define LOGQ(...) do { if (DebugLog::quiet()) { Serial.printf(__VA_ARGS__); } } while (0)
+#define LOGI(...) do { if (DebugLog::info())  { Serial.printf(__VA_ARGS__); } } while (0)
+#define LOGD(...) do { if (DebugLog::debug()) { Serial.printf(__VA_ARGS__); } } while (0)
 
 #endif
 
@@ -390,63 +481,6 @@ public:
 
 
 ==================================================
-FILE: packet.h
-==================================================
-
-#ifndef PACKET_H
-#define PACKET_H
-
-#include <Arduino.h>
-#include "config.h"
-
-struct __attribute__((packed)) SafeChainPacket {
-    char     srcID[6];      // "FOB01" + null terminator
-    uint8_t  msgType;       // MsgType enum
-    uint16_t seqNum;        // Sequence counter
-    float    latitude;      // Raw float (4 bytes)
-    float    longitude;     // Raw float (4 bytes)
-    uint8_t  hopCount;      // Current hop
-    uint8_t  maxHop;        // Limit (always 3)
-    uint8_t  battery;       // 0-100%
-    int16_t  rssi;  
-    uint16_t crc;           // CRC-16-CCITT
-};
-
-class PacketBuilder {
-public:
-    static uint16_t seqCounter;
-
-
-    // Build new packet
-    static void build(SafeChainPacket &pkt, 
-                      const char* srcID,
-                      MsgType type,
-                      EmergencyType emType,
-                      float lat, float lon,
-                      uint8_t batt);
-    
-    // Build ACK response
-    static void buildACK(SafeChainPacket &pkt,
-                         const char* srcID,
-                         uint16_t ackSeqNum);
-    
-    // CRC calculation
-    static uint16_t calcCRC16(const uint8_t *data, uint16_t length);
-    
-    // Validation
-    static bool validate(const SafeChainPacket &pkt);
-    
-    // Relay preparation
-    static bool prepareRelay(SafeChainPacket &pkt);
-    
-    // Debug print
-    static void print(const SafeChainPacket &pkt);
-};
-
-#endif
-
-
-==================================================
 FILE: router.h
 ==================================================
 
@@ -455,59 +489,239 @@ FILE: router.h
 
 #include <Arduino.h>
 #include "config.h"
-#include "packet.h"
+#include "safechain_protocol.h"
+
+// [M4] Legacy SafeChainPacket path fully removed.
+// RepeaterRouter now handles V1 frames only.
 
 class RepeaterRouter {
 private:
-    struct CacheEntry {
-        char srcID[6];
-        uint16_t seqNum;
-        uint8_t msgType;  // 👇 FIX: Added msgType to the memory!
+    // [M0-5] ownNodeID sourced from NVS via init()
+    char ownNodeID[sc::DEVICE_ID_LEN];
+
+    // -------- V1 duplicate cache --------
+    struct V1CacheEntry {
+        char     originID[sc::DEVICE_ID_LEN];
+        uint32_t eventId;
+        uint8_t  frameType;
+        bool     used;
     };
-    CacheEntry seenCache[DUPLICATE_CACHE_SIZE];
-    uint8_t cacheIndex;
-    
-    // --- NEW: Time-Based Deduplication (Spam Protection) ---
-    struct EmergencyDedup {
-        char srcID[6];
-        uint8_t msgType;
-        unsigned long timestamp;
-    };
-    EmergencyDedup recentEmergencies[10];
-    uint8_t dedupIndex;
-    // -------------------------------------------------------
-    
-    // Pending relay state
-    SafeChainPacket pendingPacket;
-    bool isPending;
-    unsigned long relayTriggerTime;
-    
-    // Statistics
+    V1CacheEntry v1Seen[DUPLICATE_CACHE_SIZE];
+    uint8_t      v1SeenIndex;
+
+    // -------- Pending V1 relay (overflow-safe timers + TTL) --------
+    sc::SafeChainFrameV1 pendingV1;
+    bool                 pendingV1Valid;
+    unsigned long        pendingV1ScheduledAt; // [M0-1]
+    uint32_t             pendingV1DelayMs;
+    unsigned long        pendingV1QueuedAt;    // [TTL]
+
+    // [M3] PSK for prepareRelay (recomputes crc16 only — auth_tag stable)
+    uint8_t psk[sc::PSK_LEN];
+    size_t  pskLen;
+
+    // -------- Stats --------
     uint32_t packetsReceived;
     uint32_t packetsRelayed;
     uint32_t packetsDropped;
+    uint32_t duplicatesDropped;
+    uint32_t ttlExpired;
 
-    // 👇 FIX: Update these two lines to include uint8_t msgType
-    bool isDuplicate(const char* srcID, uint16_t seqNum, uint8_t msgType);
-    void markSeen(const char* srcID, uint16_t seqNum, uint8_t msgType);
-    
+    bool isDuplicateV1(const sc::SafeChainFrameV1 &frame);
+    void markSeenV1(const sc::SafeChainFrameV1 &frame);
+
 public:
     RepeaterRouter();
-    
-    void init();
-    bool shouldRelay(const SafeChainPacket &pkt);
-    void queueRelay(const SafeChainPacket &pkt);
+
+    // [M0-5] nodeId MUST be the NVS-sourced string
+    void init(const char* nodeId);
+
+    // [M3] Update PSK cache after setpsk command
+    void reloadPSK(const uint8_t* key, size_t len);
+
+    bool shouldRelayV1(const sc::SafeChainFrameV1 &frame);
+    void queueRelayV1(const sc::SafeChainFrameV1 &frame);
+
     void update();
     void printStats();
-    
-private:
-    bool isDuplicate(const char* srcID, uint16_t seqNum);
-    void markSeen(const char* srcID, uint16_t seqNum);
-    
-    // --- NEW: Time-Based Methods ---
-    bool isRecentEmergency(const SafeChainPacket &pkt);
-    void markRecentEmergency(const SafeChainPacket &pkt);
 };
+
+#endif
+
+
+==================================================
+FILE: safechain_protocol.h
+==================================================
+
+#ifndef SAFECHAIN_PROTOCOL_H
+#define SAFECHAIN_PROTOCOL_H
+
+#include <Arduino.h>
+
+// ============================================================
+// M3 — Security Baseline
+//
+// SafeChainFrameV1 now carries a 4-byte auth_tag (HMAC-SHA256
+// truncated to 32 bits) before the existing crc16 field.
+// Frame size grows from 41 → 45 bytes.
+//
+// HMAC covers only the fields that are STABLE across hops:
+//   protocol_version, frame_type, event_type, flags,
+//   origin_id, event_id, attempt, max_hops,
+//   event_time_ms, lat_e7, lon_e7, battery_pct
+//
+// Mutable-per-hop fields (sender_id, hop_count, last_rssi_dbm)
+// are NOT authenticated — they are protected only by crc16.
+//
+// This means the repeater can relay without recomputing auth_tag.
+// Only the originating node sets auth_tag; all receivers verify it.
+//
+// Key: 16-byte PSK stored in NVS. Default dev key is
+// "SafeChain_Dev01" (all devices use this until provisioned).
+// Provision via Serial: setpsk <32 hex chars>
+// ============================================================
+
+namespace sc {
+
+static constexpr uint8_t  PROTOCOL_VERSION = 1;
+static constexpr uint8_t  DEVICE_ID_LEN    = 6;
+static constexpr uint8_t  MAX_HOPS_DEFAULT = 10;
+static constexpr uint8_t  PSK_LEN          = 16;  // [M3]
+
+// Default development PSK — change in production via setpsk command
+static const char PSK_DEFAULT[PSK_LEN + 1] = "SafeChain_Dev01"; // 15 chars + null
+
+// Transport-level frame meaning
+enum FrameType : uint8_t {
+    FRAME_EVENT     = 0x01,
+    FRAME_ACK       = 0x02,
+    FRAME_HEARTBEAT = 0x03,
+    FRAME_STATUS    = 0x04,
+    FRAME_CONFIG    = 0x05
+};
+
+// Emergency/business meaning
+enum EventType : uint8_t {
+    EVENT_NONE  = 0x00,
+    EVENT_FIRE  = 0x01,
+    EVENT_FLOOD = 0x02,
+    EVENT_CRIME = 0x03,
+    EVENT_SAFE  = 0x04,
+    EVENT_TEST  = 0xFF
+};
+
+enum FrameFlags : uint8_t {
+    FLAG_REQUIRE_ACK    = 1 << 0,
+    FLAG_LOW_BATTERY    = 1 << 1,
+    FLAG_GPS_VALID      = 1 << 2,
+    FLAG_HOST_COMMITTED = 1 << 3,
+    FLAG_AUTH_PRESENT   = 1 << 4   // [M3] set when auth_tag is valid
+};
+
+// [M6] Configuration keys — carried in event_type field of FRAME_CONFIG
+// config_value is carried in event_time_ms (uint32).
+// origin_id = target node ID, or "ALL" for broadcast.
+enum ConfigKey : uint8_t {
+    CONFIG_SF           = 0x01,  // Spreading factor (7-12)
+    CONFIG_TX_POWER     = 0x02,  // TX power in dBm (2-20)
+    CONFIG_HB_INTERVAL  = 0x03,  // Heartbeat interval in ms
+    CONFIG_REBOOT       = 0x04   // Trigger soft reboot (value ignored)
+};
+
+// Broadcast target — origin_id value meaning "apply to all nodes"
+static const char CONFIG_TARGET_ALL[DEVICE_ID_LEN] = "ALL";
+
+struct __attribute__((packed)) SafeChainFrameV1 {
+    uint8_t  protocol_version;
+    uint8_t  frame_type;
+    uint8_t  event_type;
+    uint8_t  flags;
+
+    char     origin_id[DEVICE_ID_LEN];
+    char     sender_id[DEVICE_ID_LEN];
+
+    uint32_t event_id;
+    uint16_t attempt;
+    uint8_t  hop_count;
+    uint8_t  max_hops;
+
+    uint32_t event_time_ms;
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+
+    uint8_t  battery_pct;
+    int16_t  last_rssi_dbm;
+
+    // [M3] Authentication tag — HMAC-SHA256 truncated to 32 bits.
+    // Covers stable inner payload (see computeHMAC32).
+    // Must be computed before crc16.
+    uint32_t auth_tag;
+
+    // Wire integrity over entire frame above (including auth_tag)
+    uint16_t crc16;
+};
+
+struct DedupKey {
+    char     origin_id[DEVICE_ID_LEN];
+    uint32_t event_id;
+    uint8_t  frame_type;
+};
+
+class Protocol {
+public:
+    static uint16_t calcCRC16(const uint8_t* data, size_t len);
+
+    // [M3] Compute 4-byte truncated HMAC-SHA256 over the stable inner payload
+    static uint32_t computeHMAC32(const uint8_t* psk, size_t pskLen,
+                                   const SafeChainFrameV1& frame);
+
+    static void initFrame(SafeChainFrameV1& frame);
+
+    // [M3] finalizeFrame now requires PSK to compute auth_tag
+    static void finalizeFrame(SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen);
+
+    // [M3] validateFrame checks both crc16 and auth_tag
+    static bool validateFrame(const SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen);
+
+    static void buildEventFrame(SafeChainFrameV1& frame,
+                                const char* originId,
+                                const char* senderId,
+                                uint32_t eventId,
+                                EventType eventType,
+                                uint16_t attempt,
+                                uint32_t eventTimeMs,
+                                int32_t latE7,
+                                int32_t lonE7,
+                                uint8_t batteryPct,
+                                bool gpsValid,
+                                bool lowBattery,
+                                const uint8_t* psk, size_t pskLen,
+                                uint8_t maxHops = MAX_HOPS_DEFAULT);
+
+    static void buildAckFrame(SafeChainFrameV1& frame,
+                              const char* gatewayOrRepeaterId,
+                              const char* originId,
+                              uint32_t eventId,
+                              EventType eventType,
+                              const uint8_t* psk, size_t pskLen,
+                              uint8_t maxHops = MAX_HOPS_DEFAULT);
+
+    // prepareRelay only updates sender_id/hop_count (not auth_tag — HMAC stable)
+    // but must recompute crc16 since sender_id and hop_count changed
+    static bool prepareRelay(SafeChainFrameV1& frame, const char* newSenderId,
+                              const uint8_t* psk, size_t pskLen);
+
+    static bool makeDedupKey(const SafeChainFrameV1& frame, DedupKey& out);
+
+    static bool isEmergencyEvent(const SafeChainFrameV1& frame);
+
+    static const char* frameTypeName(uint8_t frameType);
+    static const char* eventTypeName(uint8_t eventType);
+};
+
+} // namespace sc
 
 #endif
 
@@ -522,30 +736,90 @@ FILE: storage.h
 #include <Arduino.h>
 #include <Preferences.h>
 #include "config.h"
+#include "safechain_protocol.h"
+
+struct NodeEventRecord {
+    uint32_t magic;
+    uint32_t event_id;
+    uint8_t  event_type;
+    uint16_t attempt;
+    uint8_t  state;       // 1=pending_ack, 2=acked, 3=cleared
+    uint8_t  battery_pct;
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+    uint32_t created_ms;
+    uint32_t updated_ms;
+    uint16_t crc16;
+};
 
 class Storage {
 private:
     Preferences prefs;
-    
+
 public:
     Storage();
-    
     void init();
-    
-    // Node ID
-    String getNodeID();
-    void setNodeID(const String &id);
-    
-    // Relay mode
-    bool getRelayEnabled();
-    void setRelayEnabled(bool enabled);
-    
-    // Spreading Factor
+
+    String  getNodeID();
+    void    setNodeID(const String &id);
+
+    bool    getRelayEnabled();
+    void    setRelayEnabled(bool enabled);
+
     uint8_t getSpreadingFactor();
-    void setSpreadingFactor(uint8_t sf);
+    void    setSpreadingFactor(uint8_t sf);
+
+    uint32_t getEventCounter();
+    uint32_t nextEventCounter();
+    void     setEventCounter(uint32_t value);
+
+    bool savePendingEvent(const NodeEventRecord &record);
+    bool loadPendingEvent(NodeEventRecord &record);
+    void clearPendingEvent();
+    bool hasPendingEvent();
+
+    // [M3] PSK storage — 16-byte pre-shared key for HMAC authentication
+    // Default: sc::PSK_DEFAULT ("SafeChain_Dev01")
+    // Provision via: setpsk <32 hex chars>
+    void getPSK(uint8_t* out, size_t len);
+    void setPSK(const uint8_t* key, size_t len);
+    bool hasPSK(); // returns true if a custom key has been provisioned
 };
 
 #endif
+
+
+==================================================
+FILE: debug_log.cpp
+==================================================
+
+#include "debug_log.h"
+
+static uint8_t g_logLevel = LOG_LEVEL_DEFAULT;
+
+void DebugLog::init(uint8_t level) {
+    g_logLevel = level;
+}
+
+void DebugLog::setLevel(uint8_t level) {
+    g_logLevel = level;
+}
+
+uint8_t DebugLog::getLevel() {
+    return g_logLevel;
+}
+
+bool DebugLog::quiet() {
+    return g_logLevel >= LOG_QUIET;
+}
+
+bool DebugLog::info() {
+    return g_logLevel >= LOG_INFO;
+}
+
+bool DebugLog::debug() {
+    return g_logLevel >= LOG_DEBUG;
+}
 
 
 ==================================================
@@ -588,224 +862,459 @@ void LEDManager::off() {
 
 
 ==================================================
-FILE: packet.cpp
-==================================================
-
-#include "packet.h"
-
-// 👇 ADD THIS COUNTER
-uint16_t PacketBuilder::seqCounter = 0;
-
-// 👇 ADD THIS ENTIRE BUILD FUNCTION
-void PacketBuilder::build(SafeChainPacket &pkt, 
-                          const char* srcID,
-                          MsgType type,
-                          EmergencyType emType,
-                          float lat, float lon,
-                          uint8_t batt) {
-    memset(&pkt, 0, sizeof(SafeChainPacket));
-    strncpy(pkt.srcID, srcID, 5);
-    pkt.srcID[5] = '\0';
-    
-    pkt.msgType = (type == MSG_EMERGENCY) ? emType : type;
-    pkt.seqNum = seqCounter++;
-    pkt.latitude = lat;
-    pkt.longitude = lon;
-    pkt.hopCount = 0;
-    pkt.maxHop = MAX_HOP;
-    pkt.battery = batt;
-    pkt.rssi = 0; 
-    
-    // Calculate CRC (exclude CRC field itself)
-    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
-}
-
-uint16_t PacketBuilder::calcCRC16(const uint8_t *data, uint16_t length) {
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < length; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-            else crc <<= 1;
-        }
-    }
-    return crc;
-}
-
-bool PacketBuilder::validate(const SafeChainPacket &pkt) {
-    uint16_t expected = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
-    return (pkt.crc == expected);
-}
-
-bool PacketBuilder::prepareRelay(SafeChainPacket &pkt) {
-    if (pkt.hopCount >= pkt.maxHop) return false;
-    
-    pkt.hopCount++;
-    pkt.crc = calcCRC16((uint8_t*)&pkt, sizeof(SafeChainPacket) - 2);
-    return true;
-}
-
-void PacketBuilder::print(const SafeChainPacket &pkt) {
-    Serial.printf("[PKT] ID:%s Type:%02X Seq:%u Hop:%u/%u Lat:%.6f Lon:%.6f Batt:%u%% RSSI:%d\n",
-        pkt.srcID, pkt.msgType, pkt.seqNum, pkt.hopCount, pkt.maxHop,
-        pkt.latitude, pkt.longitude, pkt.battery, pkt.rssi);
-}
-
-
-==================================================
 FILE: router.cpp
 ==================================================
 
 #include "router.h"
 #include <LoRa.h>
+#include <string.h>
+#include "debug_log.h"
 
-RepeaterRouter::RepeaterRouter() 
-    : cacheIndex(0), isPending(false), 
-      packetsReceived(0), packetsRelayed(0), packetsDropped(0) {
-    memset(seenCache, 0, sizeof(seenCache));
-     memset(recentEmergencies, 0, sizeof(recentEmergencies)); // <-- ADD THIS
+// [M4] Legacy SafeChainPacket path removed entirely.
+// All relay logic is now V1 (SafeChainFrameV1) only.
+
+RepeaterRouter::RepeaterRouter()
+    : v1SeenIndex(0),
+      pendingV1Valid(false),
+      pendingV1ScheduledAt(0),
+      pendingV1DelayMs(0),
+      pendingV1QueuedAt(0),
+      pskLen(sc::PSK_LEN),
+      packetsReceived(0),
+      packetsRelayed(0),
+      packetsDropped(0),
+      duplicatesDropped(0),
+      ttlExpired(0) {
+    memset(ownNodeID, 0, sizeof(ownNodeID));
+    memset(v1Seen,    0, sizeof(v1Seen));
+    memset(&pendingV1, 0, sizeof(pendingV1));
+    // Default dev PSK — overwritten by reloadPSK() after storage.init()
+    memcpy(psk, sc::PSK_DEFAULT, sc::PSK_LEN);
 }
 
-void RepeaterRouter::init() {
-    Serial.println("✅ Repeater Router Ready");
+// [M0-5] Store NVS-sourced node ID
+void RepeaterRouter::init(const char* nodeId) {
+    strncpy(ownNodeID, nodeId, sc::DEVICE_ID_LEN - 1);
+    ownNodeID[sc::DEVICE_ID_LEN - 1] = '\0';
+    pendingV1Valid = false;
+    Serial.printf(">>> RepeaterRouter (V1-only): ownNodeID='%s'\n", ownNodeID);
 }
 
-extern void notifyBLE(String msg);
+// [M3] Update PSK cache
+void RepeaterRouter::reloadPSK(const uint8_t* key, size_t len) {
+    if (len > sc::PSK_LEN) len = sc::PSK_LEN;
+    memcpy(psk, key, len);
+    pskLen = len;
+    Serial.println(">>> Router PSK updated");
+}
 
-bool RepeaterRouter::shouldRelay(const SafeChainPacket &pkt) {
+// ---------------------------------------------------------------------------
+// V1 duplicate cache
+// ---------------------------------------------------------------------------
+bool RepeaterRouter::isDuplicateV1(const sc::SafeChainFrameV1 &frame) {
+    for (uint8_t i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
+        if (!v1Seen[i].used) continue;
+        if (strncmp(v1Seen[i].originID, frame.origin_id, sc::DEVICE_ID_LEN) == 0 &&
+            v1Seen[i].eventId   == frame.event_id &&
+            v1Seen[i].frameType == frame.frame_type)
+            return true;
+    }
+    return false;
+}
+
+void RepeaterRouter::markSeenV1(const sc::SafeChainFrameV1 &frame) {
+    strncpy(v1Seen[v1SeenIndex].originID, frame.origin_id, sc::DEVICE_ID_LEN);
+    v1Seen[v1SeenIndex].originID[sc::DEVICE_ID_LEN - 1] = '\0';
+    v1Seen[v1SeenIndex].eventId   = frame.event_id;
+    v1Seen[v1SeenIndex].frameType = frame.frame_type;
+    v1Seen[v1SeenIndex].used      = true;
+    v1SeenIndex = (v1SeenIndex + 1) % DUPLICATE_CACHE_SIZE;
+}
+
+// ---------------------------------------------------------------------------
+// shouldRelayV1
+// ---------------------------------------------------------------------------
+bool RepeaterRouter::shouldRelayV1(const sc::SafeChainFrameV1 &frame) {
     packetsReceived++;
-    
-    // 👇 FIX: Now we check ID, Sequence, AND the Message Type!
-    if (isDuplicate(pkt.srcID, pkt.seqNum, pkt.msgType)) {
-        Serial.println(">>> Duplicate detected");
-        if (isPending && pendingPacket.seqNum == pkt.seqNum) {
-            Serial.println(">>> SMART CANCEL: Overheard another repeater.");
-            notifyBLE("🛑 CANCELLED: Overheard Repeater relaying Seq " + String(pkt.seqNum));
-            isPending = false; 
-        }
+
+    // [M0-5] Filter by sender_id (our last-hop ID)
+    if (strncmp(frame.sender_id, ownNodeID, sc::DEVICE_ID_LEN) == 0) {
         packetsDropped++;
         return false;
     }
-    
-    // 2. Handle ACKs (CRITICAL: Do NOT return false here!)
-    if (pkt.msgType == MSG_ACK) {
-        Serial.println(">>> Overheard ACK flowing to Node");
-        notifyBLE("✅ HEARD ACK: Gateway confirmed Seq " + String(pkt.seqNum));
-        
-        if (isPending && pendingPacket.seqNum == pkt.seqNum) {
-            Serial.println(">>> SMART CANCEL: Gateway already ACKed this!");
-            notifyBLE("🛑 CANCELLED: Gateway already ACKed Seq " + String(pkt.seqNum));
-            isPending = false; 
+
+    if (isDuplicateV1(frame)) {
+        duplicatesDropped++;
+        packetsDropped++;
+        LOGD(">>> Dup V1: origin=%s event=%lu\n",
+            frame.origin_id, (unsigned long)frame.event_id);
+        // Smart cancel: if we already queued this exact frame, drop it too
+        if (pendingV1Valid &&
+            strncmp(pendingV1.origin_id, frame.origin_id, sc::DEVICE_ID_LEN) == 0 &&
+            pendingV1.event_id   == frame.event_id &&
+            pendingV1.frame_type == frame.frame_type) {
+            LOGD(">>> SMART CANCEL V1 pending relay\n");
+            pendingV1Valid = false;
         }
-        // Notice we do NOT return false here. The Repeater MUST relay the ACK!
+        return false;
     }
-    
-    // 3. Check hop limit
-    if (pkt.hopCount >= pkt.maxHop) {
-        Serial.println(">>> Max hop reached");
+
+    if (frame.hop_count >= frame.max_hops) { packetsDropped++; return false; }
+
+    // [M5] Allow FRAME_HEARTBEAT relay so gateway can track node liveness
+    if (!(frame.frame_type == sc::FRAME_EVENT  ||
+          frame.frame_type == sc::FRAME_ACK    ||
+          frame.frame_type == sc::FRAME_HEARTBEAT)) {
         packetsDropped++;
         return false;
     }
-    
+
     return true;
 }
 
-bool RepeaterRouter::isRecentEmergency(const SafeChainPacket &pkt) {
-    // Only apply to emergencies
-    if (pkt.msgType < EM_FIRE || pkt.msgType > EM_CRIME) {
-        return false;
-    }
-    
-    for (int i = 0; i < 10; i++) {
-        if (strcmp(recentEmergencies[i].srcID, pkt.srcID) == 0 &&
-            recentEmergencies[i].msgType == pkt.msgType &&
-            (millis() - recentEmergencies[i].timestamp) < 30000) {
-            return true;
-        }
-    }
-    return false;
-}
+// ---------------------------------------------------------------------------
+// queueRelayV1
+// ---------------------------------------------------------------------------
+void RepeaterRouter::queueRelayV1(const sc::SafeChainFrameV1 &frame) {
+    pendingV1 = frame;
 
-void RepeaterRouter::markRecentEmergency(const SafeChainPacket &pkt) {
-    // Only mark emergencies
-    if (pkt.msgType >= EM_FIRE && pkt.msgType <= EM_CRIME) {
-        strncpy(recentEmergencies[dedupIndex].srcID, pkt.srcID, 5);
-        recentEmergencies[dedupIndex].srcID[5] = '\0'; // Ensure null termination
-        recentEmergencies[dedupIndex].msgType = pkt.msgType;
-        recentEmergencies[dedupIndex].timestamp = millis();
-        dedupIndex = (dedupIndex + 1) % 10;
-    }
-}
-
-void RepeaterRouter::queueRelay(const SafeChainPacket &pkt) {
-    memcpy(&pendingPacket, &pkt, sizeof(SafeChainPacket));
-    
-    if (!PacketBuilder::prepareRelay(pendingPacket)) {
+    // [M0-5] Use ownNodeID as new sender for this hop
+    if (!sc::Protocol::prepareRelay(pendingV1, ownNodeID, psk, pskLen)) {
         packetsDropped++;
         return;
     }
-    
-    markSeen(pkt.srcID, pkt.seqNum, pkt.msgType);
-    relayTriggerTime = millis() + random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
-    isPending = true;
-    
-    // Send to BLE
-    String msg = "⏳ QUEUED: Node " + String(pkt.srcID) + " Seq " + String(pkt.seqNum) + " (Wait " + String(relayTriggerTime - millis()) + "ms)";
-    Serial.println(msg);
-    notifyBLE(msg);
+
+    markSeenV1(frame);
+
+    // [BONUS] ACK frames get priority backoff so node stops retrying sooner
+    uint32_t delayMs = (frame.frame_type == sc::FRAME_ACK)
+        ? random(RELAY_MIN_DELAY / 3, RELAY_MIN_DELAY)
+        : random(RELAY_MIN_DELAY, RELAY_MAX_DELAY);
+
+    // [M0-1] Overflow-safe timer
+    pendingV1ScheduledAt = millis();
+    pendingV1DelayMs     = delayMs;
+    pendingV1QueuedAt    = millis();
+    pendingV1Valid       = true;
+
+    Serial.printf(">>> Queued V1 relay: origin=%s event=%lu frame=%s hop=%u wait=%lums\n",
+        pendingV1.origin_id,
+        (unsigned long)pendingV1.event_id,
+        sc::Protocol::frameTypeName(pendingV1.frame_type),
+        pendingV1.hop_count,
+        (unsigned long)delayMs);
 }
 
+// ---------------------------------------------------------------------------
+// update() — called every loop() tick
+// ---------------------------------------------------------------------------
 void RepeaterRouter::update() {
-    if (!isPending) return;
-    if (millis() < relayTriggerTime) return;
-    
-    LoRa.beginPacket();
-    LoRa.write((uint8_t*)&pendingPacket, sizeof(SafeChainPacket));
-    LoRa.endPacket(); // Blocking send
-    LoRa.receive();   // Turn ears back on
-    
-    isPending = false;
-    packetsRelayed++;
-    
-    // Send to BLE
-    String msg = "📡 RELAYED: Seq " + String(pendingPacket.seqNum) + " (Hop " + String(pendingPacket.hopCount) + ")";
-    Serial.println(msg);
-    notifyBLE(msg);
-}
+    unsigned long now = millis();
 
-void RepeaterRouter::printStats() {
-    String stats = "\n=== REPEATER STATS ===\n";
-    stats += "Received: " + String(packetsReceived) + "\n";
-    stats += "Relayed:  " + String(packetsRelayed) + "\n";
-    stats += "Dropped:  " + String(packetsDropped) + "\n";
-    
-    if (packetsReceived > 0) {
-        float relayRate = (float)packetsRelayed / packetsReceived * 100.0;
-        stats += "Relay Rate: " + String(relayRate, 1) + "%\n";
-    }
-    
-    Serial.println(stats);
-    notifyBLE(stats);
-}
-
-bool RepeaterRouter::isDuplicate(const char* srcID, uint16_t seqNum, uint8_t msgType) {
-    for (int i = 0; i < DUPLICATE_CACHE_SIZE; i++) {
-        if (seenCache[i].seqNum == seqNum && 
-            seenCache[i].msgType == msgType &&
-            strcmp(seenCache[i].srcID, srcID) == 0) {
-            return true;
+    if (pendingV1Valid) {
+        // [TTL] Discard stale entries (e.g. queued during radio fault)
+        if ((now - pendingV1QueuedAt) > RELAY_TTL_MS) {
+            LOGD(">>> V1 relay TTL expired: origin=%s event=%lu\n",
+                pendingV1.origin_id, (unsigned long)pendingV1.event_id);
+            pendingV1Valid = false;
+            ttlExpired++;
+            packetsDropped++;
+        }
+        // [M0-1] Overflow-safe elapsed check
+        else if ((now - pendingV1ScheduledAt) >= pendingV1DelayMs) {
+            LOGD(">>> RELAYING V1 NOW...\n");
+            LoRa.beginPacket();
+            LoRa.write((uint8_t*)&pendingV1, sizeof(sc::SafeChainFrameV1));
+            LoRa.endPacket();
+            LoRa.receive();
+            pendingV1Valid = false;
+            packetsRelayed++;
+            Serial.printf(">>> V1 relayed: origin=%s event=%lu frame=%s hop=%u\n",
+                pendingV1.origin_id,
+                (unsigned long)pendingV1.event_id,
+                sc::Protocol::frameTypeName(pendingV1.frame_type),
+                pendingV1.hop_count);
         }
     }
-    return false;
 }
 
-void RepeaterRouter::markSeen(const char* srcID, uint16_t seqNum, uint8_t msgType) {
-    strncpy(seenCache[cacheIndex].srcID, srcID, 5);
-    seenCache[cacheIndex].seqNum = seqNum;
-    // 👇 FIX: Save the msgType
-    seenCache[cacheIndex].msgType = msgType;
-    cacheIndex = (cacheIndex + 1) % DUPLICATE_CACHE_SIZE;
+// ---------------------------------------------------------------------------
+// printStats
+// ---------------------------------------------------------------------------
+void RepeaterRouter::printStats() {
+    Serial.println("\n===== REPEATER STATS =====");
+    Serial.printf("Own ID             : %s\n",  ownNodeID);
+    Serial.printf("Packets Received   : %lu\n", (unsigned long)packetsReceived);
+    Serial.printf("Packets Relayed    : %lu\n", (unsigned long)packetsRelayed);
+    Serial.printf("Packets Dropped    : %lu\n", (unsigned long)packetsDropped);
+    Serial.printf("Duplicates Dropped : %lu\n", (unsigned long)duplicatesDropped);
+    Serial.printf("TTL Expired        : %lu\n", (unsigned long)ttlExpired);
+    Serial.println("==========================\n");
 }
+
+
+==================================================
+FILE: safechain_protocol.cpp
+==================================================
+
+#include "safechain_protocol.h"
+#include <string.h>
+#include "mbedtls/md.h"  // HMAC-SHA256 — built into ESP32 Arduino core
+
+namespace sc {
+
+// ---------------------------------------------------------------------------
+// CRC16-CCITT (unchanged)
+// ---------------------------------------------------------------------------
+uint16_t Protocol::calcCRC16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+// ---------------------------------------------------------------------------
+// [M3] computeHMAC32 — HMAC-SHA256 over the stable inner payload,
+// truncated to 4 bytes (first 4 bytes of the 32-byte output).
+//
+// Inner payload covers only fields that do NOT change per hop:
+//   protocol_version, frame_type, event_type, flags,
+//   origin_id, event_id, attempt, max_hops,
+//   event_time_ms, lat_e7, lon_e7, battery_pct
+// (30 bytes total)
+//
+// Excluded (change per hop):
+//   sender_id, hop_count, last_rssi_dbm, auth_tag, crc16
+// ---------------------------------------------------------------------------
+uint32_t Protocol::computeHMAC32(const uint8_t* psk, size_t pskLen,
+                                   const SafeChainFrameV1& frame) {
+    // Build the 30-byte stable inner payload
+    uint8_t inner[30];
+    size_t  pos = 0;
+
+    inner[pos++] = frame.protocol_version;
+    inner[pos++] = frame.frame_type;
+    inner[pos++] = frame.event_type;
+    inner[pos++] = frame.flags;
+
+    memcpy(inner + pos, frame.origin_id, DEVICE_ID_LEN); pos += DEVICE_ID_LEN; // 6
+
+    // Little-endian copy of multi-byte fields (packed struct, memcpy is safe)
+    memcpy(inner + pos, &frame.event_id,      4); pos += 4;
+    memcpy(inner + pos, &frame.attempt,       2); pos += 2;
+    inner[pos++] = frame.max_hops;
+    memcpy(inner + pos, &frame.event_time_ms, 4); pos += 4;
+    memcpy(inner + pos, &frame.lat_e7,        4); pos += 4;
+    memcpy(inner + pos, &frame.lon_e7,        4); pos += 4;
+    inner[pos++] = frame.battery_pct;
+
+    // pos should be exactly 30
+    // static_assert commented to allow runtime assert in debug builds
+    // assert(pos == 30);
+
+    // HMAC-SHA256 via mbedTLS (always available in ESP32 Arduino core)
+    uint8_t hmac_out[32];
+    mbedtls_md_hmac(
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+        psk, pskLen,
+        inner, pos,
+        hmac_out
+    );
+
+    // Truncate to 4 bytes
+    uint32_t tag;
+    memcpy(&tag, hmac_out, 4);
+    return tag;
+}
+
+// ---------------------------------------------------------------------------
+// initFrame
+// ---------------------------------------------------------------------------
+void Protocol::initFrame(SafeChainFrameV1& frame) {
+    memset(&frame, 0, sizeof(frame));
+    frame.protocol_version = PROTOCOL_VERSION;
+    frame.max_hops         = MAX_HOPS_DEFAULT;
+}
+
+// ---------------------------------------------------------------------------
+// [M3] finalizeFrame — compute auth_tag then crc16
+// Order matters: auth_tag must be set before CRC16 is computed so CRC16
+// covers auth_tag.
+// ---------------------------------------------------------------------------
+void Protocol::finalizeFrame(SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen) {
+    // Step 1: compute and set auth_tag
+    frame.flags   |= FLAG_AUTH_PRESENT;
+    frame.auth_tag = computeHMAC32(psk, pskLen, frame);
+   
+
+    // Step 2: compute CRC16 over everything except the last 2 bytes (crc16 field)
+    frame.crc16 = 0;
+    frame.crc16 = calcCRC16(reinterpret_cast<const uint8_t*>(&frame),
+                             sizeof(SafeChainFrameV1) - sizeof(frame.crc16));
+}
+
+// ---------------------------------------------------------------------------
+// [M3] validateFrame — check crc16, then check auth_tag
+// Returns false if either check fails.
+// ---------------------------------------------------------------------------
+bool Protocol::validateFrame(const SafeChainFrameV1& frame,
+                               const uint8_t* psk, size_t pskLen) {
+    if (frame.protocol_version != PROTOCOL_VERSION) return false;
+
+    // Step 1: CRC16 wire integrity check
+    SafeChainFrameV1 tmp = frame;
+    uint16_t rx_crc = tmp.crc16;
+    tmp.crc16 = 0;
+    uint16_t ex_crc = calcCRC16(reinterpret_cast<const uint8_t*>(&tmp),
+                                 sizeof(SafeChainFrameV1) - sizeof(tmp.crc16));
+    if (rx_crc != ex_crc) return false;
+
+    // Step 2: HMAC authentication check (only if auth flag is set)
+    if (frame.flags & FLAG_AUTH_PRESENT) {
+        uint32_t expected_tag = computeHMAC32(psk, pskLen, frame);
+        if (frame.auth_tag != expected_tag) {
+            Serial.printf(">>> AUTH FAIL: origin=%s event=%lu — invalid HMAC\n",
+                frame.origin_id, (unsigned long)frame.event_id);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// buildEventFrame
+// ---------------------------------------------------------------------------
+void Protocol::buildEventFrame(SafeChainFrameV1& frame,
+                                const char* originId, const char* senderId,
+                                uint32_t eventId, EventType eventType,
+                                uint16_t attempt, uint32_t eventTimeMs,
+                                int32_t latE7, int32_t lonE7,
+                                uint8_t batteryPct, bool gpsValid, bool lowBattery,
+                                const uint8_t* psk, size_t pskLen,
+                                uint8_t maxHops) {
+    initFrame(frame);
+
+    frame.frame_type = FRAME_EVENT;
+    frame.event_type = eventType;
+    frame.flags      = FLAG_REQUIRE_ACK;
+    if (gpsValid)   frame.flags |= FLAG_GPS_VALID;
+    if (lowBattery) frame.flags |= FLAG_LOW_BATTERY;
+
+    strncpy(frame.origin_id, originId, DEVICE_ID_LEN - 1);
+    strncpy(frame.sender_id, senderId, DEVICE_ID_LEN - 1);
+
+    frame.event_id      = eventId;
+    frame.attempt       = attempt;
+    frame.hop_count     = 0;
+    frame.max_hops      = maxHops;
+    frame.event_time_ms = eventTimeMs;
+    frame.lat_e7        = latE7;
+    frame.lon_e7        = lonE7;
+    frame.battery_pct   = batteryPct;
+    frame.last_rssi_dbm = 0;
+
+    finalizeFrame(frame, psk, pskLen);
+}
+
+// ---------------------------------------------------------------------------
+// buildAckFrame
+// ---------------------------------------------------------------------------
+void Protocol::buildAckFrame(SafeChainFrameV1& frame,
+                              const char* gatewayOrRepeaterId,
+                              const char* originId,
+                              uint32_t eventId, EventType eventType,
+                              const uint8_t* psk, size_t pskLen,
+                              uint8_t maxHops) {
+    initFrame(frame);
+
+    frame.frame_type = FRAME_ACK;
+    frame.event_type = eventType;
+    frame.flags      = 0;
+
+    strncpy(frame.origin_id, originId,              DEVICE_ID_LEN - 1);
+    strncpy(frame.sender_id, gatewayOrRepeaterId,   DEVICE_ID_LEN - 1);
+
+    frame.event_id      = eventId;
+    frame.attempt       = 0;
+    frame.hop_count     = 0;
+    frame.max_hops      = maxHops;
+    frame.event_time_ms = millis();
+    frame.battery_pct   = 100;
+    frame.last_rssi_dbm = 0;
+
+    finalizeFrame(frame, psk, pskLen);
+}
+
+// ---------------------------------------------------------------------------
+// prepareRelay — update mutable hop fields and recompute crc16.
+// auth_tag is NOT recomputed (HMAC covers stable inner payload only).
+// ---------------------------------------------------------------------------
+bool Protocol::prepareRelay(SafeChainFrameV1& frame, const char* newSenderId,
+                              const uint8_t* psk, size_t pskLen) {
+    if (frame.hop_count >= frame.max_hops) return false;
+
+    frame.hop_count++;
+    strncpy(frame.sender_id, newSenderId, DEVICE_ID_LEN - 1);
+    frame.sender_id[DEVICE_ID_LEN - 1] = '\0';
+
+    // Recompute CRC16 only — auth_tag remains unchanged (stable fields intact)
+    frame.crc16 = 0;
+    frame.crc16 = calcCRC16(reinterpret_cast<const uint8_t*>(&frame),
+                             sizeof(SafeChainFrameV1) - sizeof(frame.crc16));
+
+    // Suppress unused parameter warning — psk may be used in future
+    (void)psk; (void)pskLen;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Utilities (unchanged)
+// ---------------------------------------------------------------------------
+bool Protocol::makeDedupKey(const SafeChainFrameV1& frame, DedupKey& out) {
+    strncpy(out.origin_id, frame.origin_id, DEVICE_ID_LEN);
+    out.event_id   = frame.event_id;
+    out.frame_type = frame.frame_type;
+    return true;
+}
+
+bool Protocol::isEmergencyEvent(const SafeChainFrameV1& frame) {
+    if (frame.frame_type != FRAME_EVENT) return false;
+    return frame.event_type == EVENT_FIRE  ||
+           frame.event_type == EVENT_FLOOD ||
+           frame.event_type == EVENT_CRIME ||
+           frame.event_type == EVENT_SAFE;
+}
+
+const char* Protocol::frameTypeName(uint8_t frameType) {
+    switch (frameType) {
+        case FRAME_EVENT:     return "EVENT";
+        case FRAME_ACK:       return "ACK";
+        case FRAME_HEARTBEAT: return "HEARTBEAT";
+        case FRAME_STATUS:    return "STATUS";
+        case FRAME_CONFIG:    return "CONFIG";
+        default:              return "UNKNOWN";
+    }
+}
+
+const char* Protocol::eventTypeName(uint8_t eventType) {
+    switch (eventType) {
+        case EVENT_NONE:  return "NONE";
+        case EVENT_FIRE:  return "FIRE";
+        case EVENT_FLOOD: return "FLOOD";
+        case EVENT_CRIME: return "CRIME";
+        case EVENT_SAFE:  return "SAFE";
+        case EVENT_TEST:  return "TEST";
+        default:          return "UNKNOWN";
+    }
+}
+
+} // namespace sc
 
 
 ==================================================
@@ -813,6 +1322,20 @@ FILE: storage.cpp
 ==================================================
 
 #include "storage.h"
+#include <string.h>
+
+static constexpr uint32_t NODE_EVENT_MAGIC = 0x53434556; // "SCEV"
+
+static uint16_t recordCRC16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
 
 Storage::Storage() {}
 
@@ -842,5 +1365,87 @@ uint8_t Storage::getSpreadingFactor() {
 
 void Storage::setSpreadingFactor(uint8_t sf) {
     prefs.putUChar("sf", sf);
+}
+
+uint32_t Storage::getEventCounter() {
+    return prefs.getUInt("evt_ctr", 0);
+}
+
+uint32_t Storage::nextEventCounter() {
+    uint32_t next = prefs.getUInt("evt_ctr", 0) + 1;
+    prefs.putUInt("evt_ctr", next);
+    return next;
+}
+
+void Storage::setEventCounter(uint32_t value) {
+    prefs.putUInt("evt_ctr", value);
+}
+
+bool Storage::savePendingEvent(const NodeEventRecord &record) {
+    NodeEventRecord tmp = record;
+    tmp.magic = NODE_EVENT_MAGIC;
+    tmp.crc16 = 0;
+    tmp.crc16 = recordCRC16(reinterpret_cast<const uint8_t*>(&tmp),
+                             sizeof(NodeEventRecord) - sizeof(tmp.crc16));
+    return prefs.putBytes("pend_evt", &tmp, sizeof(NodeEventRecord))
+           == sizeof(NodeEventRecord);
+}
+
+bool Storage::loadPendingEvent(NodeEventRecord &record) {
+    if (!prefs.isKey("pend_evt")) return false;
+
+    NodeEventRecord tmp{};
+    if (prefs.getBytes("pend_evt", &tmp, sizeof(NodeEventRecord))
+        != sizeof(NodeEventRecord)) return false;
+    if (tmp.magic != NODE_EVENT_MAGIC) return false;
+
+    uint16_t rx = tmp.crc16;
+    tmp.crc16 = 0;
+    if (rx != recordCRC16(reinterpret_cast<const uint8_t*>(&tmp),
+                           sizeof(NodeEventRecord) - sizeof(tmp.crc16)))
+        return false;
+
+    tmp.crc16 = rx;
+    record = tmp;
+    return true;
+}
+
+void Storage::clearPendingEvent() {
+    prefs.remove("pend_evt");
+}
+
+bool Storage::hasPendingEvent() {
+    return prefs.isKey("pend_evt");
+}
+
+// ---------------------------------------------------------------------------
+// [M3] PSK storage
+// ---------------------------------------------------------------------------
+void Storage::getPSK(uint8_t* out, size_t len) {
+    if (len < sc::PSK_LEN) return;
+
+    if (!prefs.isKey("psk")) {
+        // No custom key provisioned — use default dev key
+        memcpy(out, sc::PSK_DEFAULT, sc::PSK_LEN);
+        return;
+    }
+
+    size_t read = prefs.getBytes("psk", out, len);
+    if (read != sc::PSK_LEN) {
+        // Corrupt NVS key — fall back to default
+        memcpy(out, sc::PSK_DEFAULT, sc::PSK_LEN);
+    }
+}
+
+void Storage::setPSK(const uint8_t* key, size_t len) {
+    if (len != sc::PSK_LEN) {
+        Serial.printf(">>> PSK must be exactly %u bytes\n", sc::PSK_LEN);
+        return;
+    }
+    prefs.putBytes("psk", key, len);
+}
+
+bool Storage::hasPSK() {
+    return prefs.isKey("psk");
 }
 

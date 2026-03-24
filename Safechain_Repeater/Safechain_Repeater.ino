@@ -1,189 +1,239 @@
+// ============================================================
+// Safechain_Repeater.ino  —  M0 + M1 + M3(auth)
+// ============================================================
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
-#include "packet.h"
 #include "router.h"
-#include "storage.h"       // <-- FIX: Tells the main file what Storage is
+#include "storage.h"
 #include "ble_terminal.h"
+#include "safechain_protocol.h"
+#include "debug_log.h"
 
 // === OBJECTS ===
-RepeaterRouter router;
+RepeaterRouter    router;
 Adafruit_NeoPixel strip(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
-Storage storage;
-BLETerminal ble;
+Storage           storage;
+BLETerminal       ble;
 
-// === STATS ===
-unsigned long lastStatsTime = 0;
-const unsigned long STATS_INTERVAL = 60000;  // Every 1 minute
+// === STATE ===
+RTC_DATA_ATTR int bootCount       = 0;
+RTC_DATA_ATTR int loraReinitCount = 0;
+uint32_t          loraFaultCount  = 0;
+unsigned long     lastStatsTime   = 0;
+unsigned long     lastLoraHealthCheck = 0;
+const unsigned long STATS_INTERVAL = 60000;
 
-unsigned long lastKeepAlive = 0;
-
-// === BLE NOTIFICATION HELPER ===
-void notifyBLE(String msg) {
-    if (ble.isConnected()) {
-        ble.send(msg);
-    }
-}
-
-// === BLE COMMAND HANDLER ===
-void onBLECommand(String cmd) {
-    cmd.trim(); cmd.toLowerCase();
-    if (cmd == "stats") router.printStats();
-    else if (cmd == "ping") notifyBLE("PONG: Repeater is alive and listening!");
-    else notifyBLE("Commands: stats, ping");
-}
+// [M3] Repeater PSK — used for validateFrame on inbound AND prepareRelay
+uint8_t repPSK[sc::PSK_LEN];
 
 // === HELPERS ===
-void setRGB(int r, int g, int b) {
-    strip.setPixelColor(0, strip.Color(r, g, b));
-    strip.show();
+void setRGB(int r, int g, int b) { strip.setPixelColor(0, strip.Color(r,g,b)); strip.show(); }
+void flashRGB(int r, int g, int b, int t) {
+    for (int i=0;i<t;i++) { setRGB(r,g,b); delay(100); setRGB(0,0,0); delay(100); }
 }
 
-void flashRGB(int r, int g, int b, int times) {
-    for (int i = 0; i < times; i++) {
-        setRGB(r, g, b);
-        delay(100);
-        setRGB(0, 0, 0);
-        delay(100);
-    }
+void loadRepPSK() {
+    storage.getPSK(repPSK, sc::PSK_LEN);
+    router.reloadPSK(repPSK, sc::PSK_LEN);
+    Serial.printf(">>> PSK loaded (%s)\n", storage.hasPSK() ? "provisioned" : "dev-default");
+}
+
+void onBLECommand(String cmd) {
+    cmd.trim(); cmd.toLowerCase();
+    if      (cmd == "stats") router.printStats();
+    else if (cmd == "ping")  ble.send("PONG: Repeater alive");
+    else ble.send("Commands: stats, ping");
+}
+
+// ============================================================
+// Direct SPI register read (private in arduino-LoRa)
+// ============================================================
+uint8_t readLoRaRegister(uint8_t reg) {
+    digitalWrite(SS_PIN, LOW);
+    SPI.transfer(reg & 0x7F);
+    uint8_t val = SPI.transfer(0x00);
+    digitalWrite(SS_PIN, HIGH);
+    return val;
+}
+
+// ============================================================
+// LoRa reinit [M1-3/4]
+// ============================================================
+bool loraReinit() {
+    Serial.printf(">>> LoRa reinit (fault #%lu)...\n", (unsigned long)(loraFaultCount+1));
+    LoRa.end(); delay(100);
+    pinMode(RST_PIN, OUTPUT);
+    digitalWrite(RST_PIN, HIGH); delay(10);
+    digitalWrite(RST_PIN, LOW);  delay(10);
+    digitalWrite(RST_PIN, HIGH); delay(20);
+    bool ok = false;
+    for (int i=1;i<=3;i++) { if (LoRa.begin(LORA_FREQ)) { ok=true; break; } delay(200); }
+    if (!ok) { loraFaultCount++; loraReinitCount++; return false; }
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW); LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE); LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD); LoRa.setTxPower(LORA_TXPOWER); LoRa.setGain(0);
+    LoRa.receive();
+    loraReinitCount++;
+    Serial.printf(">>> LoRa reinit OK (#%d)\n", loraReinitCount);
+    return true;
 }
 
 void setup() {
     Serial.begin(115200);
     delay(2000);
-    
-    for(int i = 0; i < 50 && !Serial; i++) {
-        delay(100);
-    }
-    
-    Serial.println("\n\n=== SAFECHAIN REPEATER v2.0 ===");
-    Serial.flush();
-    
-    // Init Storage and BLE
-    storage.init();
-    ble.init(storage.getNodeID().c_str());
-    ble.setCommandCallback(onBLECommand);
+    for (int i=0; i<50 && !Serial; i++) delay(100);
 
-    // LED Init
-    strip.begin();
-    strip.setBrightness(50);
-    flashRGB(50, 0, 50, 2);  // Purple boot
-    
-    // LoRa Init
-    Serial.println(">>> Init LoRa...");
-    Serial.flush();
-    
+    bootCount++;
+    Serial.printf("\n\n=== SAFECHAIN REPEATER v2.2 (Boot #%d) ===\n", bootCount);
+    DebugLog::init(LOG_LEVEL_DEFAULT);
+
+    // [M1-2] Reboot reason
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char* rs = "unknown";
+    switch (reason) {
+        case ESP_RST_POWERON:  rs="power-on";           break;
+        case ESP_RST_BROWNOUT: rs="brownout";           break;
+        case ESP_RST_TASK_WDT: rs="TASK-WATCHDOG";      break;
+        case ESP_RST_INT_WDT:  rs="INTERRUPT-WATCHDOG"; break;
+        case ESP_RST_PANIC:    rs="panic";              break;
+        case ESP_RST_SW:       rs="software";           break;
+        default: break;
+    }
+    Serial.printf(">>> Reset reason: %s\n", rs);
+    if (reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT)
+        Serial.println("!!! WATCHDOG RESET DETECTED !!!");
+
+    // [M1-1] Watchdog
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms=WDT_TIMEOUT_S*1000, .idle_core_mask=0, .trigger_panic=true
+    };
+    esp_err_t wdtErr = esp_task_wdt_init(&wdt_config);
+    if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdt_config);
+    esp_err_t addErr = esp_task_wdt_add(NULL);
+    if (addErr != ESP_OK && addErr != ESP_ERR_INVALID_STATE)
+        Serial.printf(">>> WDT add failed: %d\n", (int)addErr);
+    esp_task_wdt_reset();
+
+    storage.init();
+    String nodeId = storage.getNodeID();
+    loadRepPSK(); // [M3]
+
+    Serial.printf(">>> Node ID: %s | PSK: %s\n",
+        nodeId.c_str(), storage.hasPSK() ? "provisioned" : "dev-default");
+    Serial.printf("REPEATER FW=v2.2 | V1_SIZE=%u\n", (unsigned)sizeof(sc::SafeChainFrameV1));
+
+    ble.init(nodeId.c_str());
+    ble.setCommandCallback(onBLECommand);
+    esp_task_wdt_reset();
+
+    strip.begin(); strip.setBrightness(50); flashRGB(50, 0, 50, 2);
+
     SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
     LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
-    
     if (!LoRa.begin(LORA_FREQ)) {
-        Serial.println("❌ LoRa Init Failed!");
-        Serial.flush();
-        while (1) {
-            flashRGB(255, 0, 0, 1);
-            delay(1000);
-        }
+        Serial.println("LoRa Init Failed!");
+        while (1) { flashRGB(255,0,0,1); delay(1000); esp_task_wdt_reset(); }
     }
-    
     LoRa.setSpreadingFactor(LORA_SF);
-    LoRa.setSignalBandwidth(LORA_BW);
-    LoRa.setCodingRate4(LORA_CR);
-    LoRa.setPreambleLength(LORA_PREAMBLE);
-    LoRa.enableCrc();
-    LoRa.setSyncWord(LORA_SYNCWORD);
-    LoRa.setTxPower(LORA_TXPOWER);
+    LoRa.setSignalBandwidth(LORA_BW); LoRa.setCodingRate4(LORA_CR);
+    LoRa.setPreambleLength(LORA_PREAMBLE); LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNCWORD); LoRa.setTxPower(LORA_TXPOWER); LoRa.setGain(0);
+    randomSeed(esp_random());
 
-    LoRa.setGain(0);
-    
-    randomSeed(analogRead(0));
-    
-    Serial.println("✅ LoRa Ready (SF12, 14dBm)");
-    Serial.flush();
-    
-    // Router Init
-    router.init();
-    
-    setRGB(0, 0, 0);  // LED off to save power
-    LoRa.receive();  // <--- ADD THIS HERE!
-    
-    Serial.println("\n=================================");
+    router.init(nodeId.c_str()); // [M0-5]
+    setRGB(0,0,0);
+    LoRa.receive();
+    lastLoraHealthCheck = millis();
+    esp_task_wdt_reset();
+
+    Serial.println("LoRa Ready");
+    Serial.println("=================================");
     Serial.println("   REPEATER ACTIVE");
     Serial.println("=================================");
-    Serial.flush();
 }
 
 void loop() {
-    // Router update
+    esp_task_wdt_reset();
     router.update();
 
-    // 👇 ADD THIS ENTIRE KEEP-ALIVE BLOCK
-    if (millis() - lastKeepAlive > 12000) {  // Trigger every 12 seconds
-        lastKeepAlive = millis();
-        
-        // 1. Build a dummy Heartbeat packet
-        SafeChainPacket keepAlivePkt;
-        PacketBuilder::build(keepAlivePkt, storage.getNodeID().c_str(), 
-                             MSG_HEARTBEAT, EM_NONE, 0.0, 0.0, 100);
-        
-        // 2. Blast it at 20dBm to force a 120mA power draw from the battery!
-        LoRa.beginPacket();
-        LoRa.write((uint8_t*)&keepAlivePkt, sizeof(SafeChainPacket));
-        LoRa.endPacket(); // Blocking send
-        
-        // 3. Immediately turn the listening ears back on
-        LoRa.receive(); 
-    }
-    // 👆 END OF KEEP-ALIVE BLOCK
-    
-    // LoRa RX
     int packetSize = LoRa.parsePacket();
-    if (packetSize == sizeof(SafeChainPacket)) {
-        SafeChainPacket rxPkt;
-        LoRa.readBytes((uint8_t*)&rxPkt, sizeof(SafeChainPacket));
-        
-        if (PacketBuilder::validate(rxPkt)) {
-            rxPkt.rssi = LoRa.packetRssi();
-            
-            Serial.printf("\n[RX] ");
-            PacketBuilder::print(rxPkt);
-            
-            // Purple flash on receive
+
+    if (packetSize == sizeof(sc::SafeChainFrameV1)) {
+        sc::SafeChainFrameV1 rxFrame;
+        LoRa.readBytes((uint8_t*)&rxFrame, sizeof(sc::SafeChainFrameV1));
+
+        // [M3] validateFrame checks CRC16 + HMAC before relay decision
+        if (sc::Protocol::validateFrame(rxFrame, repPSK, sc::PSK_LEN)) {
+            rxFrame.last_rssi_dbm = LoRa.packetRssi();
+            Serial.printf("\n[RX V1] Frame=%s Event=%s Origin=%s EventID=%lu Hop=%u RSSI=%d auth=OK\n",
+                sc::Protocol::frameTypeName(rxFrame.frame_type),
+                sc::Protocol::eventTypeName(rxFrame.event_type),
+                rxFrame.origin_id, (unsigned long)rxFrame.event_id,
+                rxFrame.hop_count, rxFrame.last_rssi_dbm);
             flashRGB(50, 0, 50, 1);
-            
-            // Check if should relay
-            if (router.shouldRelay(rxPkt)) {
-                // Magenta flash for relay queue
+            if (router.shouldRelayV1(rxFrame)) {
                 flashRGB(255, 0, 255, 1);
-                router.queueRelay(rxPkt);
+                router.queueRelayV1(rxFrame);
             }
         } else {
-            Serial.println(">>> CRC FAIL - Dropped");
+            Serial.println(">>> VALIDATE FAIL - CRC or AUTH — Dropped V1");
         }
+
+    } else if (packetSize > 0) {
+        while (LoRa.available()) LoRa.read();
+        Serial.printf(">>> WARNING: Unknown size: %d\n", packetSize);
     }
-    
-    // Periodic stats
-    if (millis() - lastStatsTime > STATS_INTERVAL) {
+
+    // [M1-3] LoRa health check
+    if ((millis() - lastLoraHealthCheck) >= LORA_HEALTH_CHECK_INTERVAL_MS) {
+        lastLoraHealthCheck = millis();
+        LoRa.receive();
+        uint8_t v = readLoRaRegister(0x42);
+        if (v != 0x12) { Serial.printf(">>> LoRa health FAIL: 0x%02X\n", v); loraFaultCount++; loraReinit(); }
+        else Serial.printf(">>> LoRa health OK | faults=%lu\n", (unsigned long)loraFaultCount);
+    }
+
+    if ((millis() - lastStatsTime) > STATS_INTERVAL) {
         lastStatsTime = millis();
         router.printStats();
+        Serial.printf("LoRa faults: %lu | reinits: %d\n", (unsigned long)loraFaultCount, loraReinitCount);
     }
-    
-    // Serial commands
+
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-        cmd.toLowerCase();
-        
-        if (cmd == "stats") {
-            router.printStats();
-        } else if (cmd == "help") {
-            Serial.println("\n--- COMMANDS ---");
-            Serial.println("stats - Show statistics");
-            Serial.println("help  - This menu");
+        cmd.trim(); cmd.toLowerCase();
+        int sp = cmd.indexOf(' ');
+        String verb = (sp == -1) ? cmd : cmd.substring(0, sp);
+        String arg  = (sp == -1) ? "" : cmd.substring(sp + 1);
+
+        if      (verb == "stats") { router.printStats(); }
+        // [M3] setpsk <32 hex chars>
+        else if (verb == "setpsk") {
+            if (arg.length() == 32) {
+                uint8_t newKey[sc::PSK_LEN]; bool ok = true;
+                for (int i = 0; i < sc::PSK_LEN; i++) {
+                    long v = strtol(arg.substring(i*2, i*2+2).c_str(), nullptr, 16);
+                    if (v<0||v>255) { ok=false; break; }
+                    newKey[i] = (uint8_t)v;
+                }
+                if (ok) { storage.setPSK(newKey, sc::PSK_LEN); loadRepPSK(); Serial.println("PSK provisioned."); }
+                else      Serial.println("Invalid hex.");
+            } else Serial.println("Usage: setpsk <32 hex chars>");
+        }
+        else if (verb == "showpsk") {
+            Serial.printf("PSK: %s | first4=%02X%02X%02X%02X\n",
+                storage.hasPSK() ? "provisioned" : "dev-default",
+                repPSK[0], repPSK[1], repPSK[2], repPSK[3]);
+        }
+        else if (verb == "help") {
+            Serial.println("stats | setpsk <32hex> | showpsk | help");
         }
     }
-    
+
     delay(10);
 }
-
