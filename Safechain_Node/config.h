@@ -57,7 +57,7 @@
 // 4. LORA SETTINGS
 // =======================================================
 #define LORA_FREQ       433E6
-#define LORA_SF         11
+#define LORA_SF         9 //originally SF11 
 #define LORA_BW         125E3
 #define LORA_CR         8
 #define LORA_PREAMBLE   16
@@ -67,13 +67,25 @@
 // =======================================================
 // 5. PROTOCOL TIMERS
 // =======================================================
-#define MAX_HOP         10
+#define MAX_HOP         20
+
+// 🧠 The Smart Macro: Automatically scales RAM usage based on your MAX_HOP setting
+#if MAX_HOP <= 10
+    #define DUPLICATE_CACHE_SIZE 60
+#elif MAX_HOP <= 20
+    #define DUPLICATE_CACHE_SIZE 150
+#elif MAX_HOP <= 50
+    #define DUPLICATE_CACHE_SIZE 300
+#else 
+    // For 50 to 255 hops
+    #define DUPLICATE_CACHE_SIZE 500 
+#endif
 
 // [M4] Node no longer relays packets — these settings remain for Repeater only
 // Repeater config.h retains its own DUPLICATE_CACHE_SIZE and RELAY delays
 
-#define ACK_TIMEOUT_MS              5000
-#define RETRY_INTERVAL_MS           8000
+#define ACK_TIMEOUT_MS              15000 //5000
+#define RETRY_INTERVAL_MS           20000 //8000
 #define MAX_RETRIES                 3
 #define FAILED_RETRY_INTERVAL_MS    60000
 

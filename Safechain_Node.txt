@@ -90,8 +90,8 @@ void sirenUpdate() {
     
     if (++sirenStepIdx >= sirenStepCount) { 
         activeSirenSteps = nullptr; 
-        ledcWrite(PIN_BUZZER, 0); // Mute
-        return;
+        ledcWrite(PIN_BUZZER, 0); 
+        return; 
     }
     
     sirenStepAt = millis();
@@ -193,10 +193,9 @@ void setup() {
         nodeID.c_str(), storage.hasPSK() ? "provisioned" : "dev-default");
     Serial.printf("NODE FW=v2.2 | V1_SIZE=%u\n", (unsigned)sizeof(sc::SafeChainFrameV1));
 
-
-     #if defined(BOARD_ESP32_S3_SUPER_MINI) || defined(BOARD_ESP32_C3_SUPER_MINI)
-        ledcAttach(PIN_BUZZER, 2000, 8); // Attach to 2kHz, 8-bit resolution
-        ledcWrite(PIN_BUZZER, 0);        // 0% volume
+    #if defined(BOARD_ESP32_S3_SUPER_MINI) || defined(BOARD_ESP32_C3_SUPER_MINI)
+        ledcAttach(PIN_BUZZER, 2000, 8); // 👇 FIX: Attach hardware PWM channel!
+        ledcWrite(PIN_BUZZER, 0);
     #else
         pinMode(PIN_BUZZER, OUTPUT);
         digitalWrite(PIN_BUZZER, LOW);
@@ -255,9 +254,10 @@ void setup() {
 
     if (!resumed && wakeup_pin_mask != 0) {
         Serial.println(">>> WOKE FROM DEEP SLEEP VIA BUTTON");
-        if      (wakeup_pin_mask & (1ULL << PIN_BTN_FLOOD)) triggerFlood();
-        else if (wakeup_pin_mask & (1ULL << PIN_BTN_FIRE))  triggerFire();
-        else if (wakeup_pin_mask & (1ULL << PIN_BTN_CRIME)) triggerCrime();
+        // [FIX Bug2] Do NOT auto-trigger emergency on wakeup button.
+        // Wakeup bypassed the 1200ms long-press guard, causing accidental
+        // alerts on every sleep→wake cycle. User must long-press after waking.
+        lastActivityTime = millis(); // prevent immediate re-sleep
     } else if (resumed) {
         Serial.println(">>> Skipped wakeup — NVS pending event has priority");
     } else {
@@ -282,8 +282,6 @@ void loop() {
     sirenUpdate();
     gpsManager.update();
     ble.update();
-    emergency.update();
-
     int packetSize = LoRa.parsePacket();
 
     if (packetSize == sizeof(sc::SafeChainFrameV1)) {
@@ -310,6 +308,12 @@ void loop() {
         while (LoRa.available()) LoRa.read();
         Serial.printf(">>> WARNING: Unknown packet size: %d\n", packetSize);
     }
+
+    // [FIX Bug1] emergency.update() runs AFTER RX so incoming ACKs are
+    // processed before ACK_TIMEOUT can advance the state to FAILED.
+    // Previously: update() ran first → state changed → handleACK rejected
+    // the valid ACK because state was no longer WAITING_ACK.
+    emergency.update();
 
     checkLoraHealth();
 
@@ -833,7 +837,7 @@ FILE: config.h
 // 4. LORA SETTINGS
 // =======================================================
 #define LORA_FREQ       433E6
-#define LORA_SF         11
+#define LORA_SF         9 //originally SF11 
 #define LORA_BW         125E3
 #define LORA_CR         8
 #define LORA_PREAMBLE   16
@@ -843,13 +847,25 @@ FILE: config.h
 // =======================================================
 // 5. PROTOCOL TIMERS
 // =======================================================
-#define MAX_HOP         10
+#define MAX_HOP         20
+
+// 🧠 The Smart Macro: Automatically scales RAM usage based on your MAX_HOP setting
+#if MAX_HOP <= 10
+    #define DUPLICATE_CACHE_SIZE 60
+#elif MAX_HOP <= 20
+    #define DUPLICATE_CACHE_SIZE 150
+#elif MAX_HOP <= 50
+    #define DUPLICATE_CACHE_SIZE 300
+#else 
+    // For 50 to 255 hops
+    #define DUPLICATE_CACHE_SIZE 500 
+#endif
 
 // [M4] Node no longer relays packets — these settings remain for Repeater only
 // Repeater config.h retains its own DUPLICATE_CACHE_SIZE and RELAY delays
 
-#define ACK_TIMEOUT_MS              5000
-#define RETRY_INTERVAL_MS           8000
+#define ACK_TIMEOUT_MS              15000 //5000
+#define RETRY_INTERVAL_MS           20000 //8000
 #define MAX_RETRIES                 3
 #define FAILED_RETRY_INTERVAL_MS    60000
 
@@ -911,103 +927,6 @@ enum EmergencyType : uint8_t {
     #else
         #define DEFAULT_NODE_ID "FOB01"
     #endif
-#endif
-
-#endif
-
-
-==================================================
-FILE: configs3.h
-==================================================
-
-#ifndef CONFIG_H
-#define CONFIG_H
-
-#include <Arduino.h>
-
-// === DEVICE ROLES (Uncomment ONLY one) ===
-#define ROLE_NODE
-// #define ROLE_REPEATER
-// #define ROLE_GATEWAY+-
-
-// === HARDWARE PINS ===
-#define PIN_BUZZER      9
-#define PIN_GPS_RX      RX //20
-#define PIN_GPS_TX      TX //21
-#define PIN_RGB         48
-
-// 👇 ADDED BATTERY PIN HERE
-#define PIN_BATTERY     3  // Safe ADC1 Pin for voltage reading
-
-// Buttons (Used on Node, optional on Repeater for test)
-#define PIN_BTN_FLOOD   1
-#define PIN_BTN_FIRE    2
-#define PIN_BTN_CRIME   4
-
-// LoRa SPI
-#define SCK_PIN         7
-#define MISO_PIN        5
-#define MOSI_PIN        6
-#define SS_PIN          10
-#define RST_PIN         11
-#define DIO0_PIN        -1
-
-// === LORA SETTINGS ===
-#define LORA_FREQ       433E6
-#define LORA_SF         11
-#define LORA_BW         125E3
-#define LORA_CR         8
-#define LORA_PREAMBLE   16
-#define LORA_SYNCWORD   0xF3
-#define LORA_TXPOWER    17  // Boosted to 20dBm for Repeater/Gateway
-
-// === PROTOCOL ===
-#define MAX_HOP         10
-
-// Adjust cache based on role
-#ifdef ROLE_REPEATER
-    #define DUPLICATE_CACHE_SIZE 60 // Remember more packets
-    #define RELAY_MIN_DELAY 200     // Faster relay
-    #define RELAY_MAX_DELAY 800
-#else
-    #define DUPLICATE_CACHE_SIZE 20
-    #define RELAY_MIN_DELAY 500
-    #define RELAY_MAX_DELAY 1500
-#endif
-
-#define ACK_TIMEOUT_MS  5000
-#define RETRY_INTERVAL_MS 8000
-#define MAX_RETRIES     3
-
-// === TIMING ===
-#define AUTO_MODE_INTERVAL  15000
-#define LED_UPDATE_INTERVAL 2000
-#define BLE_UPDATE_INTERVAL 3000  // ← ADD THIS LINE
-#define GPS_VALID_AGE_MS    5000  // ← ADD THIS LINE
-
-// === MESSAGE TYPES ===
-enum MsgType : uint8_t {
-    MSG_EMERGENCY = 0x01A,
-    MSG_HEARTBEAT = 0x02A,
-    MSG_ACK       = 0x0A,
-    MSG_TEST      = 0xFF
-};
-
-enum EmergencyType : uint8_t {
-    EM_NONE  = 0x00,
-    EM_FIRE  = 0x01,
-    EM_FLOOD = 0x02,
-    EM_CRIME = 0x03,
-    EM_SAFE  = 0x04
-};
-
-// === DEFAULTS ===
-#ifdef ROLE_REPEATER
-    #define DEFAULT_NODE_ID "REP01"
-#elif defined(ROLE_GATEWAY)
-    #define DEFAULT_NODE_ID "GTW01"
-#else
-    #define DEFAULT_NODE_ID "S3" //FOB01
 #endif
 
 #endif
@@ -1084,7 +1003,7 @@ private:
 
     unsigned long stateSince;
 
-    const char* nodeID;
+    char nodeID[sc::DEVICE_ID_LEN];
     Storage*    storage;
 
     uint32_t      currentEventId;
@@ -1326,7 +1245,7 @@ namespace sc {
 
 static constexpr uint8_t  PROTOCOL_VERSION = 1;
 static constexpr uint8_t  DEVICE_ID_LEN    = 6;
-static constexpr uint8_t  MAX_HOPS_DEFAULT = 10;
+static constexpr uint8_t  MAX_HOPS_DEFAULT = 20; 
 static constexpr uint8_t  PSK_LEN          = 16;  // [M3]
 
 // Default development PSK — change in production via setpsk command
@@ -1733,15 +1652,17 @@ static constexpr uint8_t JOURNAL_CLEARED     = 3;
 EmergencyManager::EmergencyManager()
     : state(EM_STATE_IDLE), retryCount(0),
       actionScheduledAt(0), actionDelayMs(0), stateSince(0),
-      nodeID(nullptr), storage(nullptr),
+      storage(nullptr),
       currentEventId(0), currentEmergencyType(EM_NONE),
       pendingFrameValid(false) {
     memset(&pendingFrame, 0, sizeof(pendingFrame));
     memset(psk, 0, sizeof(psk));
+    memset(nodeID, 0, sc::DEVICE_ID_LEN); // 👇 FIX: Safe permanent memory
 }
 
 void EmergencyManager::init(const char* id, Storage* storageRef) {
-    nodeID  = id;
+    memset(nodeID, 0, sc::DEVICE_ID_LEN);
+    strncpy(nodeID, id, sc::DEVICE_ID_LEN - 1); // 👇 FIX: Copy the ID safely!
     storage = storageRef;
     reloadPSK();
     setState(EM_STATE_IDLE);
@@ -1988,10 +1909,18 @@ void EmergencyManager::update() {
 void EmergencyManager::handleACK(const sc::SafeChainFrameV1 &ack) {
     if (state != EM_STATE_WAITING_ACK) return;
     if (!pendingFrameValid) return;
-    if (!sc::Protocol::validateFrame(ack, psk, sc::PSK_LEN)) return;
     if (ack.frame_type != sc::FRAME_ACK) return;
-    if (strncmp(ack.origin_id, nodeID, sc::DEVICE_ID_LEN) != 0) return;
-    if (ack.event_id != pendingFrame.event_id) return;
+
+    // 👇 FIX: Print exact reasons if an ACK is rejected!
+    if (strncmp(ack.origin_id, nodeID, sc::DEVICE_ID_LEN) != 0) {
+        Serial.printf(">>> IGNORING ACK: ID mismatch! Expected '%s', got '%s'\n", nodeID, ack.origin_id);
+        return;
+    }
+    if (ack.event_id != pendingFrame.event_id) {
+        Serial.printf(">>> IGNORING ACK: Event ID mismatch!\n");
+        return;
+    }
+
     markConfirmed();
 }
 

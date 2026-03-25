@@ -28,7 +28,7 @@ private:
 
     unsigned long stateSince;
 
-    const char* nodeID;
+    char nodeID[sc::DEVICE_ID_LEN];
     Storage*    storage;
 
     uint32_t      currentEventId;

@@ -46,7 +46,18 @@ void onBLECommand(String cmd) {
     cmd.trim(); cmd.toLowerCase();
     if      (cmd == "stats") router.printStats();
     else if (cmd == "ping")  ble.send("PONG: Repeater alive");
-    else ble.send("Commands: stats, ping");
+    else if (cmd == "info") {
+        ble.send("=== REPEATER INFO ===");
+        ble.send("LoRa faults: " + String(loraFaultCount));
+        ble.send("LoRa reinits: " + String(loraReinitCount));
+        ble.send("LoRa Status: OK");
+    }
+    else if (cmd == "reboot") {
+        ble.send("Rebooting Repeater...");
+        delay(500);
+        ESP.restart();
+    }
+    else ble.send("Commands: stats, ping, info, reboot");
 }
 
 // ============================================================
@@ -145,7 +156,7 @@ void setup() {
     LoRa.setSyncWord(LORA_SYNCWORD); LoRa.setTxPower(LORA_TXPOWER); LoRa.setGain(0);
     randomSeed(esp_random());
 
-    router.init(nodeId.c_str()); // [M0-5]
+   router.init(nodeId.c_str());
     setRGB(0,0,0);
     LoRa.receive();
     lastLoraHealthCheck = millis();
@@ -161,32 +172,61 @@ void loop() {
     esp_task_wdt_reset();
     router.update();
 
-    int packetSize = LoRa.parsePacket();
-
+   int packetSize = LoRa.parsePacket();
     if (packetSize == sizeof(sc::SafeChainFrameV1)) {
         sc::SafeChainFrameV1 rxFrame;
         LoRa.readBytes((uint8_t*)&rxFrame, sizeof(sc::SafeChainFrameV1));
 
-        // [M3] validateFrame checks CRC16 + HMAC before relay decision
+        // 👇 FIX 1: Pass the Repeater's PSK into the validation function!
         if (sc::Protocol::validateFrame(rxFrame, repPSK, sc::PSK_LEN)) {
             rxFrame.last_rssi_dbm = LoRa.packetRssi();
-            Serial.printf("\n[RX V1] Frame=%s Event=%s Origin=%s EventID=%lu Hop=%u RSSI=%d auth=OK\n",
-                sc::Protocol::frameTypeName(rxFrame.frame_type),
-                sc::Protocol::eventTypeName(rxFrame.event_type),
-                rxFrame.origin_id, (unsigned long)rxFrame.event_id,
-                rxFrame.hop_count, rxFrame.last_rssi_dbm);
+            
+            // Format a clean string to send
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "[RX] Origin: %s | Event: %lu | Hops: %u | RSSI: %d dBm",
+                rxFrame.origin_id,
+                (unsigned long)rxFrame.event_id,
+                rxFrame.hop_count,
+                rxFrame.last_rssi_dbm);
+                
+            Serial.println(logBuf);
+            
+            // 👇 FIX 2: Use ble.send() instead of ble.println()
+            if (ble.isConnected()) {
+                ble.send(logBuf); 
+            }
+                
             flashRGB(50, 0, 50, 1);
             if (router.shouldRelayV1(rxFrame)) {
                 flashRGB(255, 0, 255, 1);
+                Serial.println(">>> Relaying packet...");
+                
+                if (ble.isConnected()) {
+                    ble.send(">>> Relaying packet..."); 
+                }
+                
                 router.queueRelayV1(rxFrame);
+            } else {
+                Serial.println(">>> Ignored (Duplicate/Max Hops)");
+                
+                if (ble.isConnected()) {
+                    ble.send(">>> Ignored (Duplicate/Max Hops)"); 
+                }
             }
         } else {
-            Serial.println(">>> VALIDATE FAIL - CRC or AUTH — Dropped V1");
+            Serial.println(">>> CRC/AUTH FAIL - Dropped");
         }
 
     } else if (packetSize > 0) {
-        while (LoRa.available()) LoRa.read();
-        Serial.printf(">>> WARNING: Unknown size: %d\n", packetSize);
+        // QUICKLY clear the ghost traffic buffer without hanging the CPU
+        int bytesRead = 0;
+        while (LoRa.available() && bytesRead < 256) { 
+            LoRa.read(); 
+            bytesRead++;
+        }
+        Serial.printf(">>> WARNING: Dropped Ghost Traffic (size: %d)\n", packetSize);
+        // Force radio back to listening mode
+        LoRa.receive(); 
     }
 
     // [M1-3] LoRa health check

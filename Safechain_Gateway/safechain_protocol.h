@@ -30,7 +30,7 @@ namespace sc {
 
 static constexpr uint8_t  PROTOCOL_VERSION = 1;
 static constexpr uint8_t  DEVICE_ID_LEN    = 6;
-static constexpr uint8_t  MAX_HOPS_DEFAULT = 10;
+static constexpr uint8_t  MAX_HOPS_DEFAULT = 20;
 static constexpr uint8_t  PSK_LEN          = 16;  // [M3]
 
 // Default development PSK — change in production via setpsk command

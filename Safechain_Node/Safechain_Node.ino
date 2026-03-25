@@ -85,8 +85,8 @@ void sirenUpdate() {
     
     if (++sirenStepIdx >= sirenStepCount) { 
         activeSirenSteps = nullptr; 
-        ledcWrite(PIN_BUZZER, 0); // Mute
-        return;
+        ledcWrite(PIN_BUZZER, 0); 
+        return; 
     }
     
     sirenStepAt = millis();
@@ -188,10 +188,9 @@ void setup() {
         nodeID.c_str(), storage.hasPSK() ? "provisioned" : "dev-default");
     Serial.printf("NODE FW=v2.2 | V1_SIZE=%u\n", (unsigned)sizeof(sc::SafeChainFrameV1));
 
-
-     #if defined(BOARD_ESP32_S3_SUPER_MINI) || defined(BOARD_ESP32_C3_SUPER_MINI)
-        ledcAttach(PIN_BUZZER, 2000, 8); // Attach to 2kHz, 8-bit resolution
-        ledcWrite(PIN_BUZZER, 0);        // 0% volume
+    #if defined(BOARD_ESP32_S3_SUPER_MINI) || defined(BOARD_ESP32_C3_SUPER_MINI)
+        ledcAttach(PIN_BUZZER, 2000, 8); // 👇 FIX: Attach hardware PWM channel!
+        ledcWrite(PIN_BUZZER, 0);
     #else
         pinMode(PIN_BUZZER, OUTPUT);
         digitalWrite(PIN_BUZZER, LOW);
@@ -250,9 +249,10 @@ void setup() {
 
     if (!resumed && wakeup_pin_mask != 0) {
         Serial.println(">>> WOKE FROM DEEP SLEEP VIA BUTTON");
-        if      (wakeup_pin_mask & (1ULL << PIN_BTN_FLOOD)) triggerFlood();
-        else if (wakeup_pin_mask & (1ULL << PIN_BTN_FIRE))  triggerFire();
-        else if (wakeup_pin_mask & (1ULL << PIN_BTN_CRIME)) triggerCrime();
+        // [FIX Bug2] Do NOT auto-trigger emergency on wakeup button.
+        // Wakeup bypassed the 1200ms long-press guard, causing accidental
+        // alerts on every sleep→wake cycle. User must long-press after waking.
+        lastActivityTime = millis(); // prevent immediate re-sleep
     } else if (resumed) {
         Serial.println(">>> Skipped wakeup — NVS pending event has priority");
     } else {
@@ -277,8 +277,6 @@ void loop() {
     sirenUpdate();
     gpsManager.update();
     ble.update();
-    emergency.update();
-
     int packetSize = LoRa.parsePacket();
 
     if (packetSize == sizeof(sc::SafeChainFrameV1)) {
@@ -305,6 +303,12 @@ void loop() {
         while (LoRa.available()) LoRa.read();
         Serial.printf(">>> WARNING: Unknown packet size: %d\n", packetSize);
     }
+
+    // [FIX Bug1] emergency.update() runs AFTER RX so incoming ACKs are
+    // processed before ACK_TIMEOUT can advance the state to FAILED.
+    // Previously: update() ran first → state changed → handleACK rejected
+    // the valid ACK because state was no longer WAITING_ACK.
+    emergency.update();
 
     checkLoraHealth();
 

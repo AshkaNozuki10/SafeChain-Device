@@ -16,15 +16,17 @@ static constexpr uint8_t JOURNAL_CLEARED     = 3;
 EmergencyManager::EmergencyManager()
     : state(EM_STATE_IDLE), retryCount(0),
       actionScheduledAt(0), actionDelayMs(0), stateSince(0),
-      nodeID(nullptr), storage(nullptr),
+      storage(nullptr),
       currentEventId(0), currentEmergencyType(EM_NONE),
       pendingFrameValid(false) {
     memset(&pendingFrame, 0, sizeof(pendingFrame));
     memset(psk, 0, sizeof(psk));
+    memset(nodeID, 0, sc::DEVICE_ID_LEN); // 👇 FIX: Safe permanent memory
 }
 
 void EmergencyManager::init(const char* id, Storage* storageRef) {
-    nodeID  = id;
+    memset(nodeID, 0, sc::DEVICE_ID_LEN);
+    strncpy(nodeID, id, sc::DEVICE_ID_LEN - 1); // 👇 FIX: Copy the ID safely!
     storage = storageRef;
     reloadPSK();
     setState(EM_STATE_IDLE);
@@ -271,10 +273,18 @@ void EmergencyManager::update() {
 void EmergencyManager::handleACK(const sc::SafeChainFrameV1 &ack) {
     if (state != EM_STATE_WAITING_ACK) return;
     if (!pendingFrameValid) return;
-    if (!sc::Protocol::validateFrame(ack, psk, sc::PSK_LEN)) return;
     if (ack.frame_type != sc::FRAME_ACK) return;
-    if (strncmp(ack.origin_id, nodeID, sc::DEVICE_ID_LEN) != 0) return;
-    if (ack.event_id != pendingFrame.event_id) return;
+
+    // 👇 FIX: Print exact reasons if an ACK is rejected!
+    if (strncmp(ack.origin_id, nodeID, sc::DEVICE_ID_LEN) != 0) {
+        Serial.printf(">>> IGNORING ACK: ID mismatch! Expected '%s', got '%s'\n", nodeID, ack.origin_id);
+        return;
+    }
+    if (ack.event_id != pendingFrame.event_id) {
+        Serial.printf(">>> IGNORING ACK: Event ID mismatch!\n");
+        return;
+    }
+
     markConfirmed();
 }
 

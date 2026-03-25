@@ -13,7 +13,7 @@
 
 // === LORA SETTINGS ===
 #define LORA_FREQ       433E6
-#define LORA_SF         11
+#define LORA_SF         9 // 11 
 #define LORA_BW         125E3
 #define LORA_CR         8
 #define LORA_PREAMBLE   16
@@ -21,7 +21,20 @@
 #define LORA_TXPOWER    20
 
 // === PROTOCOL ===
-#define DUPLICATE_CACHE_SIZE    100
+#define MAX_HOP         20
+
+// 🧠 The Smart Macro: Automatically scales RAM usage based on your MAX_HOP setting
+#if MAX_HOP <= 10
+    #define DUPLICATE_CACHE_SIZE 60
+#elif MAX_HOP <= 20
+    #define DUPLICATE_CACHE_SIZE 150
+#elif MAX_HOP <= 50
+    #define DUPLICATE_CACHE_SIZE 300
+#else 
+    // For 50 to 255 hops
+    #define DUPLICATE_CACHE_SIZE 500 
+#endif
+
 #define MAX_EVENTS              50
 #define DEFAULT_NODE_ID         "GTW01"
 

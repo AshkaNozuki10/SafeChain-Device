@@ -14,7 +14,7 @@
 
 // === LORA SETTINGS ===
 #define LORA_FREQ       433E6
-#define LORA_SF         11
+#define LORA_SF         9 //11
 #define LORA_BW         125E3
 #define LORA_CR         8
 #define LORA_PREAMBLE   16
@@ -22,8 +22,20 @@
 #define LORA_TXPOWER    20
 
 // === PROTOCOL ===
-#define MAX_HOP                 10
-#define DUPLICATE_CACHE_SIZE    50
+#define MAX_HOP         20
+
+// 🧠 The Smart Macro: Automatically scales RAM usage based on your MAX_HOP setting
+#if MAX_HOP <= 10
+    #define DUPLICATE_CACHE_SIZE 60
+#elif MAX_HOP <= 20
+    #define DUPLICATE_CACHE_SIZE 150
+#elif MAX_HOP <= 50
+    #define DUPLICATE_CACHE_SIZE 300
+#else 
+    // For 50 to 255 hops
+    #define DUPLICATE_CACHE_SIZE 500 
+#endif
+
 #define RELAY_MIN_DELAY         300
 #define RELAY_MAX_DELAY         1000
 // [M0-BONUS] Drop relay entries queued longer than this (stale after radio fault)
